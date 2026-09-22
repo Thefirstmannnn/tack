@@ -1,0 +1,609 @@
+import { beforeEach, describe, expect, it } from 'bun:test';
+import { db, eq, schema } from '@tack/db';
+import { SYNC_MODELS, scopes } from '@tack/shared/events';
+import { createComment, toggleReaction } from '../../src/content/comment-service.ts';
+import { createDoc, createDocCollection, setDocAccess } from '../../src/content/doc-service.ts';
+import { newId } from '../../src/internal.ts';
+import { createInvite } from '../../src/org/invite-service.ts';
+import { addTeamMember, createTeam } from '../../src/org/team-service.ts';
+import { catchUp, SYNC_CATCHUP_MODELS } from '../../src/realtime/backfill.ts';
+import {
+  addMember,
+  createUser,
+  createWorkspace,
+  resetDatabase,
+  type Workspace,
+} from '../../src/test-support.ts';
+import { createIssue, setRelation, subscribe, updateIssue } from '../../src/work/issue-service.ts';
+import { createProject } from '../../src/work/project-service.ts';
+import { createView } from '../../src/work/view-service.ts';
+
+function teamKey(): string {
+  return `D${newId()
+    .replace(/[^a-z0-9]/gi, '')
+    .slice(0, 4)
+    .toUpperCase()}`;
+}
+
+let workspace: Workspace;
+
+beforeEach(async () => {
+  await resetDatabase();
+  workspace = await createWorkspace('Nova');
+});
+
+function modelIds(actions: { model: string; modelId: string }[], model: string): string[] {
+  return actions.filter((action) => action.model === model).map((action) => action.modelId);
+}
+
+describe('catchUp', () => {
+  it('never embeds legacy notification content in reconnect packets', async () => {
+    const id = newId();
+    await db.insert(schema.notification).values({
+      id,
+      organizationId: workspace.organizationId,
+      userId: workspace.admin.userId,
+      type: 'comment_created',
+      actorType: 'system',
+      actorId: 'tack',
+      actorName: 'Tack',
+      entityType: 'doc',
+      entityId: newId(),
+      title: 'Private roadmap',
+      body: 'Confidential detail',
+      url: '/docs/restricted',
+      surfaceInInbox: true,
+      syncId: schema.nextSyncId,
+    });
+    const action = (await catchUp(workspace.admin, 0)).actions.find(
+      (row) => row.model === 'notification' && row.modelId === id,
+    );
+    expect(action).toBeDefined();
+    expect(Object.keys(action?.data ?? {}).sort()).toEqual(['id', 'syncId', 'visible']);
+  });
+
+  it('covers every synced model so no model silently misses a backfill', () => {
+    expect([...SYNC_CATCHUP_MODELS].sort()).toEqual([...SYNC_MODELS].sort());
+  });
+
+  it('returns only rows newer than the cursor and reports the new high water mark', async () => {
+    const before = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Before the cursor',
+    });
+    const cursor = (await catchUp(workspace.admin, 0)).syncId;
+
+    const after = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'After the cursor',
+    });
+
+    const result = await catchUp(workspace.admin, cursor);
+    expect(modelIds(result.actions, 'issue')).toEqual([after.issue.id]);
+    expect(modelIds(result.actions, 'issue')).not.toContain(before.issue.id);
+    expect(result.syncId).toBeGreaterThanOrEqual(after.issue.syncId);
+    expect(result.truncated).toBe(false);
+  });
+
+  it('replays the latest row state for an issue that changed many times', async () => {
+    const created = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'First title',
+    });
+    const cursor = (await catchUp(workspace.admin, 0)).syncId;
+
+    await updateIssue(workspace.admin, created.issue.id, { title: 'Second title' });
+    const third = await updateIssue(workspace.admin, created.issue.id, { title: 'Third title' });
+
+    const result = await catchUp(workspace.admin, cursor);
+    const issues = result.actions.filter((action) => action.model === 'issue');
+    expect(issues).toHaveLength(1);
+    expect(issues[0]?.data['title']).toBe('Third title');
+    expect(issues[0]?.syncId).toBe(third.issue.syncId);
+  });
+
+  it('replays a dismissed notification as a delete', async () => {
+    const id = newId();
+    await db.insert(schema.notification).values({
+      id,
+      organizationId: workspace.organizationId,
+      userId: workspace.admin.userId,
+      type: 'comment_created',
+      actorType: 'user',
+      actorId: workspace.admin.userId,
+      actorName: 'Someone',
+      entityType: 'issue',
+      entityId: newId(),
+      title: 'A notification',
+      url: '/inbox',
+      deliveredChannels: ['inbox'],
+      syncId: schema.nextSyncId,
+    });
+    const cursor = (await catchUp(workspace.admin, 0)).syncId;
+    await db
+      .update(schema.notification)
+      .set({ dismissedAt: new Date(), syncId: schema.nextSyncId })
+      .where(eq(schema.notification.id, id));
+
+    const result = await catchUp(workspace.admin, cursor);
+    const action = result.actions.find(
+      (candidate) => candidate.model === 'notification' && candidate.modelId === id,
+    );
+
+    expect(action?.action).toBe('delete');
+  });
+
+  it('backfills reviewer ids with each issue', async () => {
+    const reviewer = await addMember(workspace, 'member', { name: 'Rhea Reviewer' });
+    const created = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Review me',
+      reviewerIds: [reviewer.user.id],
+    });
+
+    const result = await catchUp(workspace.admin, 0);
+    const action = result.actions.find(
+      (entry) => entry.model === 'issue' && entry.modelId === created.issue.id,
+    );
+    expect(action?.data['reviewerIds']).toEqual([reviewer.user.id]);
+  });
+
+  it('does not widen an issue replay through its project scope', async () => {
+    const { project } = await createProject(workspace.admin, {
+      name: 'Scoped project',
+      teamIds: [workspace.teamId],
+    });
+    const created = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      projectId: project.id,
+      title: 'Scoped issue',
+    });
+
+    const result = await catchUp(workspace.admin, 0);
+    const action = result.actions.find(
+      (entry) => entry.model === 'issue' && entry.modelId === created.issue.id,
+    );
+    expect(action?.scopes).toContain(scopes.team(workspace.teamId));
+    expect(action?.scopes).toContain(scopes.issue(created.issue.id));
+    expect(action?.scopes).not.toContain(scopes.project(project.id));
+  });
+
+  it('never returns a row from another organization', async () => {
+    const other = await createWorkspace('Rival');
+    await createIssue(other.admin, { teamId: other.teamId, title: 'Rival roadmap' });
+    await createDoc(other.admin, { title: 'Rival strategy' });
+
+    const result = await catchUp(workspace.admin, 0);
+    for (const action of result.actions) {
+      expect(action.organizationId).toBe(workspace.organizationId);
+      expect(action.scopes.some((scope) => scope.includes(other.organizationId))).toBe(false);
+      expect(action.scopes.some((scope) => scope.includes(other.teamId))).toBe(false);
+    }
+  });
+
+  it('sorts every action by sync id so the client can apply them in order', async () => {
+    await createIssue(workspace.admin, { teamId: workspace.teamId, title: 'One' });
+    await createDocCollection(workspace.admin, { name: 'Handbook' });
+    await createIssue(workspace.admin, { teamId: workspace.teamId, title: 'Two' });
+
+    const result = await catchUp(workspace.admin, 0);
+    const ordered = [...result.actions].sort((left, right) => left.syncId - right.syncId);
+    expect(result.actions.map((action) => action.syncId)).toEqual(
+      ordered.map((action) => action.syncId),
+    );
+  });
+
+  it('backfills the models that used to share another model name', async () => {
+    const teammate = await createUser('Tess Teammate');
+    await createInvite(workspace.admin, { email: teammate.email });
+    const collection = await createDocCollection(workspace.admin, { name: 'Runbooks' });
+    const issue = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Own the on call rota',
+    });
+    await subscribe(workspace.admin, issue.issue.id);
+
+    const result = await catchUp(workspace.admin, 0);
+    const models = new Set(result.actions.map((action) => action.model));
+    expect(models.has('invitation')).toBe(true);
+    expect(models.has('doc_collection')).toBe(true);
+    expect(models.has('issue_subscription')).toBe(true);
+    expect(modelIds(result.actions, 'doc_collection')).toEqual([collection.collection.id]);
+    const subscription = result.actions.find((action) => action.model === 'issue_subscription');
+    expect(subscription?.scopes).toEqual([scopes.user(workspace.admin.userId)]);
+  });
+
+  it('replays mirrored relations only to each owning issue team and scope', async () => {
+    const source = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Source',
+    });
+    const target = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Target',
+    });
+    await setRelation(workspace.admin, source.issue.id, {
+      relatedIssueId: target.issue.id,
+      type: 'blocks',
+    });
+
+    const result = await catchUp(workspace.admin, 0);
+    const relations = result.actions.filter((action) => action.model === 'issue_relation');
+    expect(relations).toHaveLength(2);
+    expect(relations.map((action) => action.scopes)).toContainEqual([
+      scopes.organization(workspace.organizationId),
+      scopes.team(workspace.teamId),
+      scopes.issue(source.issue.id),
+    ]);
+    expect(relations.map((action) => action.scopes)).toContainEqual([
+      scopes.organization(workspace.organizationId),
+      scopes.team(workspace.teamId),
+      scopes.issue(target.issue.id),
+    ]);
+  });
+
+  it('resolves every attachment parent to its authoritative replay scope', async () => {
+    const issue = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Attached issue',
+    });
+    const comment = await createComment(workspace.admin, issue.issue.id, {
+      body: 'Attached comment',
+    });
+    const { project } = await createProject(workspace.admin, {
+      name: 'Attached project',
+      teamIds: [workspace.teamId],
+    });
+    const ids = {
+      issue: newId(),
+      comment: newId(),
+      project: newId(),
+      missing: newId(),
+    };
+    await db.insert(schema.attachment).values([
+      {
+        id: ids.issue,
+        organizationId: workspace.organizationId,
+        parentType: 'issue',
+        parentId: issue.issue.id,
+        fileName: 'issue.txt',
+        contentType: 'text/plain',
+        size: 1,
+        storageKey: `uploads/${ids.issue}`,
+        status: 'ready',
+        uploadedById: workspace.admin.userId,
+        syncId: 800_001,
+      },
+      {
+        id: ids.comment,
+        organizationId: workspace.organizationId,
+        parentType: 'comment',
+        parentId: comment.comment.id,
+        fileName: 'comment.txt',
+        contentType: 'text/plain',
+        size: 1,
+        storageKey: `uploads/${ids.comment}`,
+        status: 'ready',
+        uploadedById: workspace.admin.userId,
+        syncId: 800_002,
+      },
+      {
+        id: ids.project,
+        organizationId: workspace.organizationId,
+        parentType: 'project',
+        parentId: project.id,
+        fileName: 'project.txt',
+        contentType: 'text/plain',
+        size: 1,
+        storageKey: `uploads/${ids.project}`,
+        status: 'ready',
+        uploadedById: workspace.admin.userId,
+        syncId: 800_003,
+      },
+      {
+        id: ids.missing,
+        organizationId: workspace.organizationId,
+        parentType: 'issue',
+        parentId: 'issue_missing',
+        fileName: 'missing.txt',
+        contentType: 'text/plain',
+        size: 1,
+        storageKey: `uploads/${ids.missing}`,
+        status: 'ready',
+        uploadedById: workspace.admin.userId,
+        syncId: 800_004,
+      },
+    ]);
+
+    const result = await catchUp(workspace.admin, 0);
+    const byId = new Map(
+      result.actions
+        .filter((action) => action.model === 'attachment')
+        .map((action) => [action.modelId, action]),
+    );
+    expect(byId.get(ids.issue)?.scopes).toEqual([
+      scopes.organization(workspace.organizationId),
+      scopes.team(workspace.teamId),
+      scopes.issue(issue.issue.id),
+    ]);
+    expect(byId.get(ids.comment)?.scopes).toEqual([
+      scopes.organization(workspace.organizationId),
+      scopes.team(workspace.teamId),
+      scopes.issue(issue.issue.id),
+    ]);
+    expect(byId.get(ids.project)?.scopes).toEqual([
+      scopes.organization(workspace.organizationId),
+      scopes.project(project.id),
+      scopes.team(workspace.teamId),
+    ]);
+    expect(byId.has(ids.missing)).toBe(false);
+  });
+
+  it('marks the page truncated when there is more than the caller asked for', async () => {
+    await createIssue(workspace.admin, { teamId: workspace.teamId, title: 'One' });
+    await createIssue(workspace.admin, { teamId: workspace.teamId, title: 'Two' });
+
+    const result = await catchUp(workspace.admin, 0, 1);
+    expect(result.actions).toHaveLength(1);
+    expect(result.truncated).toBe(true);
+  });
+
+  it('only returns notifications addressed to the caller', async () => {
+    const teammate = await createUser('Nate Notified');
+    const notify = (userId: string, title: string, syncId: number) => ({
+      id: newId(),
+      organizationId: workspace.organizationId,
+      userId,
+      type: 'issue_assigned',
+      actorType: 'user',
+      actorId: workspace.admin.userId,
+      actorName: 'Nova Admin',
+      entityType: 'issue',
+      entityId: newId(),
+      title,
+      url: '/inbox',
+      syncId,
+    });
+    const mine = notify(workspace.admin.userId, 'For the admin', 1000);
+    const theirs = notify(teammate.id, 'For a teammate', 1001);
+    await db.insert(schema.notification).values([mine, theirs]);
+
+    const result = await catchUp(workspace.admin, 0);
+    const notifications = result.actions.filter((action) => action.model === 'notification');
+    expect(notifications.map((action) => action.modelId)).toEqual([mine.id]);
+    for (const action of notifications) {
+      expect(action.scopes).toEqual([scopes.user(workspace.admin.userId)]);
+      expect(action.data['userId']).toBeUndefined();
+    }
+  });
+
+  it('scopes a team membership to its team so it cannot cross a team boundary', async () => {
+    const joined = await addMember(workspace, 'member', { teamIds: [] });
+    await addTeamMember(workspace.admin, workspace.teamId, { userId: joined.user.id });
+
+    const result = await catchUp(workspace.admin, 0);
+    const memberships = result.actions.filter((action) => action.model === 'team_member');
+    expect(memberships.length).toBeGreaterThan(0);
+    for (const action of memberships) {
+      expect(action.scopes).toContain(`team:${workspace.teamId}`);
+      expect(
+        action.scopes.every(
+          (scope) => scope.startsWith('team:') === false || scope === `team:${workspace.teamId}`,
+        ),
+      ).toBe(true);
+    }
+  });
+});
+
+describe('catch up never crosses a team boundary', () => {
+  it('hides another team and its issues from a member', async () => {
+    const outsider = await createTeam(workspace.admin, {
+      name: 'Design',
+      key: teamKey(),
+    });
+    const { principal: member } = await addMember(workspace, 'member', {
+      teamIds: [workspace.teamId],
+    });
+
+    const mine = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Visible to the member',
+    });
+    const theirs = await createIssue(workspace.admin, {
+      teamId: outsider.team.id,
+      title: 'Confidential to Design',
+    });
+
+    const result = await catchUp(member, 0);
+    const ids = new Set(result.actions.map((action) => action.modelId));
+
+    expect(ids.has(mine.issue.id)).toBe(true);
+    expect(ids.has(theirs.issue.id)).toBe(false);
+
+    const bodies = JSON.stringify(result.actions);
+    expect(bodies).toContain('Visible to the member');
+    expect(bodies).not.toContain('Confidential to Design');
+  });
+
+  it('still gives an admin the whole workspace', async () => {
+    const outsider = await createTeam(workspace.admin, {
+      name: 'Design',
+      key: teamKey(),
+    });
+    const theirs = await createIssue(workspace.admin, {
+      teamId: outsider.team.id,
+      title: 'Admin can see this',
+    });
+
+    const result = await catchUp(workspace.admin, 0);
+    expect(result.actions.some((action) => action.modelId === theirs.issue.id)).toBe(true);
+  });
+
+  it('gives a guest on no teams none of the workspace issues', async () => {
+    await createIssue(workspace.admin, { teamId: workspace.teamId, title: 'Not for guests' });
+    const { principal: guest } = await addMember(workspace, 'guest', { teamIds: [] });
+
+    const result = await catchUp(guest, 0);
+    expect(JSON.stringify(result.actions)).not.toContain('Not for guests');
+  });
+
+  it('keeps pending invitations away from anyone who cannot invite', async () => {
+    await createInvite(workspace.admin, {
+      email: `secret.${newId().slice(0, 8)}@example.com`,
+      role: 'admin',
+    });
+    const { principal: contributor } = await addMember(workspace, 'contributor');
+
+    const asContributor = await catchUp(contributor, 0);
+    expect(asContributor.actions.some((action) => action.model === 'invitation')).toBe(false);
+
+    const asAdmin = await catchUp(workspace.admin, 0);
+    expect(asAdmin.actions.some((action) => action.model === 'invitation')).toBe(true);
+  });
+});
+
+describe('catch up respects document access', () => {
+  it('never returns a private doc body to somebody it was not shared with', async () => {
+    const { principal: other } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Compensation review',
+      content: 'Numbers nobody else should read.',
+      visibility: 'private',
+    });
+
+    const result = await catchUp(other, 0);
+    const payload = JSON.stringify(result.actions);
+    expect(payload).not.toContain('Numbers nobody else should read.');
+    expect(result.actions.some((action) => action.modelId === doc.id)).toBe(false);
+  });
+
+  it('returns a private doc once it is shared', async () => {
+    const { principal: invited, user: invitedUser } = await addMember(workspace, 'member');
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Shared plan',
+      content: 'For a named few.',
+      visibility: 'private',
+    });
+    await setDocAccess(workspace.admin, doc.id, {
+      grants: [{ subjectType: 'user', subjectId: invitedUser.id, level: 'read' }],
+    });
+
+    const result = await catchUp(invited, 0);
+    expect(result.actions.some((action) => action.modelId === doc.id)).toBe(true);
+  });
+
+  it('keeps workspace docs reaching everyone', async () => {
+    const { principal: guest } = await addMember(workspace, 'guest', { teamIds: [] });
+    const { doc } = await createDoc(workspace.admin, {
+      title: 'Handbook',
+      content: 'Everybody reads this.',
+      visibility: 'workspace',
+    });
+    const result = await catchUp(guest, 0);
+    expect(result.actions.some((action) => action.modelId === doc.id)).toBe(true);
+  });
+});
+
+describe('catch up scopes reactions to the team that owns the issue', () => {
+  it('hides a reaction on another team issue from a member', async () => {
+    const outsider = await createTeam(workspace.admin, { name: 'Design', key: teamKey() });
+    const { principal: member } = await addMember(workspace, 'member', {
+      teamIds: [workspace.teamId],
+    });
+
+    const theirs = await createIssue(workspace.admin, {
+      teamId: outsider.team.id,
+      title: 'Confidential to Design',
+    });
+    const comment = await createComment(workspace.admin, theirs.issue.id, {
+      body: 'Only Design should see this thread.',
+    });
+    const reaction = await toggleReaction(workspace.admin, comment.comment.id, { emoji: '🚀' });
+
+    const result = await catchUp(member, 0);
+    const ids = new Set(result.actions.map((action) => action.modelId));
+
+    for (const action of reaction.actions) {
+      expect(ids.has(action.modelId)).toBe(false);
+    }
+  });
+
+  it('still gives a reaction on the member own team issue', async () => {
+    const { principal: member } = await addMember(workspace, 'member', {
+      teamIds: [workspace.teamId],
+    });
+
+    const mine = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Ours',
+    });
+    const comment = await createComment(workspace.admin, mine.issue.id, { body: 'Nice work.' });
+    const reaction = await toggleReaction(workspace.admin, comment.comment.id, { emoji: '🚀' });
+
+    const result = await catchUp(member, 0);
+    const ids = new Set(result.actions.map((action) => action.modelId));
+
+    const reacted = reaction.actions.filter((action) => action.model === 'reaction');
+    expect(reacted.length).toBeGreaterThan(0);
+    for (const action of reacted) {
+      expect(ids.has(action.modelId)).toBe(true);
+    }
+  });
+});
+
+describe('catch up respects who a saved view was shared with', () => {
+  it('never replays a team view to somebody on another team', async () => {
+    const design = await createTeam(workspace.admin, { name: 'Design', key: teamKey() });
+    const { principal: engineer } = await addMember(workspace, 'member', {
+      teamIds: [workspace.teamId],
+    });
+    const { principal: designer } = await addMember(workspace, 'member', {
+      teamIds: [design.team.id],
+    });
+
+    const { view } = await createView(engineer, {
+      name: 'Engineering reorg',
+      filter: { visibility: 'team', teamId: workspace.teamId },
+    });
+
+    const forTheDesigner = await catchUp(designer, 0);
+    expect(forTheDesigner.actions.some((action) => action.modelId === view.id)).toBe(false);
+    expect(JSON.stringify(forTheDesigner.actions)).not.toContain('Engineering reorg');
+
+    const forTheEngineer = await catchUp(engineer, 0);
+    expect(forTheEngineer.actions.some((action) => action.modelId === view.id)).toBe(true);
+  });
+
+  it('still replays a workspace view to everyone', async () => {
+    const design = await createTeam(workspace.admin, { name: 'Design', key: teamKey() });
+    const { principal: designer } = await addMember(workspace, 'member', {
+      teamIds: [design.team.id],
+    });
+
+    const { view } = await createView(workspace.admin, {
+      name: 'Everything',
+      filter: { visibility: 'workspace' },
+    });
+
+    const result = await catchUp(designer, 0);
+    expect(result.actions.some((action) => action.modelId === view.id)).toBe(true);
+  });
+});
+
+describe('a catch up reads one consistent picture', () => {
+  it('takes every model from the same snapshot, so nothing slips between queries', async () => {
+    const before = await catchUp(workspace.admin, 0);
+    const { issue } = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Written mid flight',
+    });
+    const { doc } = await createDoc(workspace.admin, { title: 'Also written' });
+
+    const after = await catchUp(workspace.admin, before.syncId);
+    const ids = after.actions.map((action) => action.modelId);
+
+    expect(ids).toContain(issue.id);
+    expect(ids).toContain(doc.id);
+    expect(after.syncId).toBeGreaterThanOrEqual(Math.max(issue.syncId, doc.syncId));
+  });
+});

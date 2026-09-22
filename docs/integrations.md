@@ -1,0 +1,313 @@
+# Integrations
+
+Tack includes GitHub and Slack as optional external product integrations. Each
+is configured per workspace under **Settings**, **Integrations**. Slack remains
+hidden until the deployment operator completes provider setup and enables its
+global server-side gate.
+
+When an integration is not configured, Tack hides the affordance rather than
+showing a button that fails. If a connect button is missing, the environment
+variable behind it is unset.
+
+For the MCP server, which is how AI assistants connect, see [MCP server](mcp.md).
+
+## GitHub
+
+Links pull requests to issues, so the board reflects what is actually happening
+in the repository without anyone updating it by hand.
+
+What you get:
+
+- A **Pull requests** view, showing open pull requests against the issues they
+  close.
+- Every open pull request in a watched repository, with its activity, reviews,
+  comments and checks. Linked Tack tasks and projects appear as context.
+- **Branch names** generated from an issue, so the link is automatic. The
+  command palette and the `copy_branch_name` MCP tool both produce them.
+
+### Setting it up
+
+This needs a [GitHub App](https://docs.github.com/en/apps), not an OAuth app.
+GitHub Apps are installed per repository and their tokens are short lived, which
+is the right shape for something reading your code host.
+
+1. Create a GitHub App, under your organization if the repositories belong to
+   one.
+2. Set the **Callback URL** to `https://tack.example.com/api/integrations/github/callback`.
+3. Tick **Request user authorization (OAuth) during installation**. This is not
+   optional. It is what makes GitHub send a `code` back with the installation,
+   and that code is the only evidence Tack has that the person finishing the
+   flow actually controls the installation they named. A callback without one is
+   refused.
+4. Leave the **Setup URL** empty, or set it to that same callback. This is a
+   different field from the Callback URL and it is the one that decides where
+   GitHub sends somebody after they install. Point it at a page rather than the
+   callback and the install finishes in the browser without Tack ever seeing
+   it: the settings page fills with `installation_id` and `setup_action` in the
+   address bar, nothing is saved, and the workspace still reads Not connected.
+   Tack now recognises that landing and says so, but the fix is here.
+5. Set the webhook URL to `https://tack.example.com/api/webhooks/github`, and
+   set a webhook secret.
+6. Apply the verified least privilege set from
+   [GitHub App permissions and events](github-app.md):
+   - **Metadata**: read-only
+   - **Pull requests**: read-only
+   - **Issues**: read-only
+   - **Checks**: read-only
+   - **Commit statuses**: read-only
+   - **Actions**: read-only
+   Do not grant organization or account permissions.
+7. Subscribe to these events:
+   - **Repository**
+   - **Pull request**
+   - **Pull request review**
+   - **Pull request review comment**
+   - **Pull request review thread**
+   - **Issue comment**
+   - **Check suite**
+   - **Check run**
+   - **Status**
+   - **Workflow run**
+   GitHub delivers `installation` and `installation_repositories` automatically.
+8. Generate a private key and download the PEM, and note the app's client ID and
+   a generated client secret.
+
+Then set:
+
+```bash
+GITHUB_APP_ID=123456
+GITHUB_APP_SLUG=your-app-slug
+GITHUB_APP_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----"
+GITHUB_APP_CLIENT_ID=Iv1.abc123
+GITHUB_APP_CLIENT_SECRET=<the client secret you generated>
+GITHUB_WEBHOOK_SECRET=<the secret you set>
+```
+
+The private key is multi-line. Escaped `\n` sequences are handled, so you can
+paste it as one line into a hosting dashboard that will not take newlines.
+
+`GITHUB_APP_SLUG` is what makes the connect button appear.
+`GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` are what let it discover
+repositories. `GITHUB_APP_CLIENT_ID` and `GITHUB_APP_CLIENT_SECRET` are what let
+it exchange the callback code and confirm the installation belongs to the person
+connecting, so it refuses to connect anything without them rather than binding an
+installation it cannot attribute. All five need to be set for the flow to
+complete.
+
+Then go to **Settings**, **Integrations**, **GitHub**, connect, and pick which
+repositories to install it on.
+
+## Slack
+
+Slack has one global, server-side capability gate. When `SLACK_ENABLED=true`,
+Slack becomes available to every current and future Tack organization. False
+or unset keeps the settings card hidden, makes Slack routes return not found,
+stops inbound event processing, and leaves the scheduled Slack DM worker with
+no eligible work.
+
+Global availability does not merge tenant data or credentials. Each Tack
+organization needs its own manager-authorized OAuth connection. OAuth state is
+bound to the initiating Tack organization and user, bot credentials are
+encrypted with organization and integration context, and one Slack workspace
+can belong to only one Tack organization. Channel mappings, notifications,
+and unfurls remain scoped to the owning organization and mapped Tack team.
+
+### Set up the Slack app
+
+Configure the app with the OAuth redirect URL for your deployment:
+
+```text
+https://tack.example.com/api/integrations/slack/callback
+```
+
+Request exactly these eight Bot Token Scopes:
+
+- `channels:read`
+- `groups:read`
+- `chat:write`
+- `links:read`
+- `links:write`
+- `im:write`
+- `users:read`
+- `users:read.email`
+
+The webhook request URL is:
+
+```text
+https://tack.example.com/api/webhooks/slack
+```
+
+Subscribe the bot to `link_shared` and add only your Tack deployment hostname,
+such as `tack.example.com`, under Link unfurling. Slack requires an app
+reinstall when unfurl domains change. Use Slack's HTTP Events API, not Socket
+Mode. Tack does not require slash commands or interactive issue mutations.
+
+Activate public distribution in Slack before enabling Tack's global gate. A
+private Slack app can be installed only in its development workspace, so public
+distribution is required for managers from other Slack workspaces to complete
+OAuth.
+
+### Launch order
+
+1. Keep `SLACK_ENABLED=false` or unset. Regenerate every Slack credential that
+   has been exposed in chat, screenshots, logs, or shell history. Revoke unused
+   app-level and bot tokens. Tack needs only the client ID, client secret, and
+   signing secret.
+2. Store the new `SLACK_CLIENT_SECRET` and `SLACK_SIGNING_SECRET` as sensitive
+   deployment values, configure `SLACK_CLIENT_ID`, and apply the database
+   migration that enforces unique Slack workspace ownership.
+3. Deploy the Slack-capable code while the global gate remains false. Verify
+   the deployment and migration before changing Slack's public availability.
+4. Configure the OAuth redirect URL, bot scopes, Events API request URL,
+   `link_shared` subscription, and unfurl domain in Slack. Reinstall the app if
+   Slack requires it after a scope or domain change, then activate public
+   distribution.
+5. Set `SLACK_ENABLED=true` and redeploy. This enables Slack for every current
+   and future Tack organization, so treat it as a global release rather than a
+   workspace-specific setting.
+6. As a manager in a test Tack organization, complete OAuth from **Settings**,
+   **Integrations**. Invite the Tack bot to a controlled Slack channel, map the
+   channel to an Tack team or the explicit workspace-wide scope, then test an
+   outbound notification and an issue-link unfurl before announcing support.
+
+Do not set `SLACK_ENABLED=true` before the migration, dark deployment,
+credential rotation, Slack configuration, and public distribution are
+complete. Public distribution alone does not enable Slack inside Tack.
+
+### Channel and credential behavior
+
+The bot must be invited or joined before a channel can be mapped. Tack fetches
+the channel's canonical metadata from Slack and does not trust client-supplied
+channel details. An unmapped channel does not unfurl. A team mapping limits
+unfurls to issues in that exact Tack team. A null team mapping is an explicit
+workspace-wide scope, not an implicit fallback.
+
+OAuth stores the bot token encrypted at rest. Rotating `BETTER_AUTH_SECRET`
+makes existing encrypted Slack credentials unusable, so reconnect Slack as an
+Tack administrator after the rotation. The token is not shown in settings or
+route responses.
+
+Slack integration behavior:
+
+- **Capability boundary.** OAuth credentials and public distribution alone do
+  not enable Slack. `SLACK_ENABLED=true` is the global server-side release gate.
+  An organization still needs its own authorized OAuth connection before it can
+  send or receive Slack activity.
+- **Tenant boundary.** The global gate changes feature availability only.
+  Organization authorization, unique Slack workspace ownership, encrypted
+  credentials, canonical joined-channel mappings, and organization and team
+  scoping continue to isolate every connection and delivery.
+- **Granted scope storage.** Granted scopes are stored as non-secret
+  integration metadata. The bot token is never exposed to the browser.
+- **Notification routing.** Eligible pull request activity is queued durably for
+  configured team channels. Personal notifications use Slack DMs when the
+  recipient is mapped, can still access the subject and has that channel
+  enabled. Channel mappings are workspace or team managed; personal DM settings
+  do not opt an entire shared channel out of delivery.
+- **Availability states.** Notification settings distinguish available,
+  unmapped, reauthorization-required, and unavailable states so a user is not
+  offered a DM preference that the current integration cannot satisfy.
+- **Quiet hours.** Non-urgent Slack DMs are deferred until the quiet-hours
+  window ends; urgent assignments can bypass quiet hours using the existing
+  notification setting. A DM-only notification with no other enabled channel
+  is persisted with a deferred delivery time and sent after quiet hours end.
+- **Threads and delivery safety.** Each conversation has one root per Slack
+  destination. Later events become ordered replies with broadcast disabled.
+  Confirmed rate limits retry with backoff. A timeout or crash after a send may
+  have succeeded becomes `ambiguous`, blocks later replies and is not resent
+  automatically. This avoids turning an unknown Slack result into a duplicate
+  message. It is not an exactly-once provider guarantee. The scheduled worker
+  runs every minute in bounded batches with claim-token fencing.
+- **Member mapping.** OAuth loads the complete Slack user directory before it
+  maps every current Tack workspace member whose normalized email has exactly
+  one matching active human Slack user. Ambiguous emails remain unmapped so a
+  private notification cannot be routed to an arbitrary account.
+- **Member resynchronization.** Workspace admins can use **Sync Slack members**
+  in integration settings to refresh a healthy connection without repeating
+  OAuth. Newly joined Tack members remain unmapped until a workspace admin
+  runs **Sync Slack members** again. Connections with missing directory scopes,
+  unusable credentials, or a reauthorization requirement must reconnect first.
+  Tack replaces the mapping snapshot atomically only after every Slack
+  directory page succeeds. The settings panel reports how many current
+  workspace members are matched.
+
+### Note on GitHub sign-in
+
+`GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET` are a different thing. Those are
+for signing in with GitHub, and they come from an OAuth app. You can have
+either, both, or neither. See [Configuration](configuration.md#authentication).
+
+## Email
+
+Email carries invites, sign-in codes and enabled personal event notifications.
+Notification email is queued and sent only to the recipient's current verified
+address after checking preferences and subject access again. Retries reuse an
+encrypted frozen payload and the same Resend idempotency key. Unknown outcomes
+stop before the provider's idempotency window expires. Digests are not included.
+Transactional sign-in and invitation email retains its existing delivery path.
+
+Tack sends through [Resend](https://resend.com) only.
+
+```bash
+RESEND_API_KEY=re_...
+EMAIL_FROM="Tack <tack@example.com>"
+```
+
+`EMAIL_FROM` must be on a domain verified in Resend. If it is not, every send
+fails, including sign-in codes and invitations.
+
+See [Inbox conversations](features/inbox.md) for notification categories,
+worker diagnostics, migration order and rollback switches.
+
+## Webhooks out
+
+Tack does not send outbound webhooks yet. It is on the [roadmap](roadmap.md),
+and it is one of the more requested things.
+
+Until then the MCP server covers most of what people want webhooks for, since an
+agent can poll or be triggered and has full read access.
+
+## When one does not work
+
+**The install finished but the workspace still says Not connected, and the
+address bar shows `installation_id` and `setup_action`.** The App's **Setup
+URL** points at a page instead of `/api/integrations/github/callback`, so GitHub
+handed the install to the browser and Tack never saw it. Fix the Setup URL, then
+connect again. Nothing needs undoing first: the installation on GitHub is real,
+it was only never recorded.
+
+**The install finished and Tack says it could not verify who owns it.**
+**Request user authorization (OAuth) during installation** is unticked, so
+GitHub sent no `code` and Tack refused to bind an installation it cannot
+attribute to the person connecting. Tick it, confirm `GITHUB_APP_CLIENT_ID` and
+`GITHUB_APP_CLIENT_SECRET` are set, then connect again.
+
+**The connect button is missing.** `GITHUB_APP_SLUG` is unset. Restart after
+setting it.
+
+**OAuth redirects to an error.** The callback URL registered with GitHub
+does not exactly match your deployment, including scheme and trailing slash.
+Check `NEXT_PUBLIC_APP_URL` too, since the redirect is built from it.
+
+**Webhooks arrive but nothing happens.** The signature is not verifying. Confirm
+`GITHUB_WEBHOOK_SECRET` matches what the GitHub App has. The integrations page
+shows recent deliveries and their responses, which is the fastest place to look.
+
+**Slack says the workspace is already claimed.** That Slack team is bound to a
+different Tack organization. Disconnect Slack from its current Tack workspace
+first, then reconnect from the intended organization. Do not try to bypass the
+ownership check or copy credentials between workspaces.
+
+**Slack reports missing permissions, says it needs authorization, or it stopped
+working after a `BETTER_AUTH_SECRET` rotation.** Reconnect Slack as an Tack
+administrator. This replaces the encrypted OAuth credential and renews the
+granted scope. Do not attempt to recover or paste a stored token.
+
+**A channel cannot be mapped, or mapped links do not unfurl.** Invite or join
+the Tack bot to that exact Slack channel, then map it again. Confirm that the
+mapping is enabled and that the channel has the intended exact team scope or
+explicit workspace-wide scope. Unmapped channels deliberately do not unfurl.
+
+**Pull requests do not link to issues.** The branch name has to contain the
+issue identifier. Use the branch name Tack generates, or include `ENG-42` in
+your own.

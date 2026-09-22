@@ -1,0 +1,186 @@
+import { and, db, eq, ilike, inArray, isNull, or, schema, sql } from '@tack/db';
+import { UNSET_FILTER_VALUE } from '@tack/shared/filters';
+import type { Principal } from '@tack/shared/policy';
+import { assertCan } from '@tack/shared/policy';
+import type { IssueFilterInput } from '@tack/shared/validators';
+import type { SQL } from 'drizzle-orm';
+import type { FilterContext } from './issue-predicates.ts';
+import { buildFilterFilters } from './issue-predicates.ts';
+
+export type IssueVisibility = 'team' | 'workspace-analytics' | 'standup';
+
+export interface IssueWhereInput {
+  readonly visibility: IssueVisibility;
+  readonly filter: IssueFilterInput;
+  readonly now: Date;
+  readonly calendar?: FilterContext['calendar'];
+  readonly advancedFilter?: 'include' | 'omit';
+}
+
+export type IssueVisibilityScope =
+  | { readonly kind: 'workspace' }
+  | { readonly kind: 'teams'; readonly teamIds: readonly string[] };
+
+export function issueVisibilityScope(principal: Principal): IssueVisibilityScope {
+  return principal.role === 'admin'
+    ? { kind: 'workspace' }
+    : { kind: 'teams', teamIds: [...new Set(principal.teamIds)].sort() };
+}
+
+export function visibleTeamFilters(principal: Principal): SQL[] {
+  const scope = issueVisibilityScope(principal);
+  if (scope.kind === 'workspace') return [];
+  if (scope.teamIds.length === 0) return [sql`false`];
+  return [inArray(schema.issue.teamId, [...scope.teamIds])];
+}
+
+function visibilityFilters(principal: Principal, visibility: IssueVisibility): SQL[] {
+  if (visibility === 'standup') {
+    assertCan(principal, 'standup:read');
+    return [];
+  }
+  if (visibility === 'workspace-analytics') {
+    assertCan(principal, 'analytics:read');
+    return [];
+  }
+  assertCan(principal, 'issue:read');
+  return visibleTeamFilters(principal);
+}
+
+function participantFilters(
+  participantId: string | undefined,
+  workType: IssueFilterInput['workType'],
+): SQL[] {
+  if (participantId === undefined) {
+    if (workType === 'assigned') return [sql`${schema.issue.assigneeId} is not null`];
+    if (workType === 'reviewing')
+      return [
+        sql`exists (select 1 from ${schema.issueReviewer} where ${schema.issueReviewer.issueId} = ${schema.issue.id})`,
+      ];
+    return [];
+  }
+  if (workType === 'reviewing')
+    return [
+      sql`exists (select 1 from ${schema.issueReviewer} where ${schema.issueReviewer.issueId} = ${schema.issue.id} and ${schema.issueReviewer.userId} = ${participantId})`,
+    ];
+  if (workType === 'assigned')
+    return [
+      participantId === UNSET_FILTER_VALUE
+        ? isNull(schema.issue.assigneeId)
+        : eq(schema.issue.assigneeId, participantId),
+    ];
+  if (participantId === UNSET_FILTER_VALUE) return [isNull(schema.issue.assigneeId)];
+  return [
+    or(
+      eq(schema.issue.assigneeId, participantId),
+      sql`exists (
+        select 1 from ${schema.issueReviewer}
+        where ${schema.issueReviewer.issueId} = ${schema.issue.id}
+          and ${schema.issueReviewer.userId} = ${participantId}
+      )`,
+    ) ?? sql`false`,
+  ];
+}
+
+function agentFilters(principal: Principal, filter: IssueFilterInput): SQL[] {
+  if (!filter.aiOnly) return [];
+  return [
+    sql`exists (
+    select 1 from ${schema.member}
+    where ${schema.member.organizationId} = ${principal.organizationId}
+      and ${schema.member.isAgent} = true
+      and (
+        ${schema.member.userId} = ${schema.issue.creatorId}
+        or ${schema.member.userId} = ${schema.issue.assigneeId}
+        or exists (select 1 from ${schema.issueReviewer} where ${schema.issueReviewer.issueId} = ${schema.issue.id} and ${schema.issueReviewer.userId} = ${schema.member.userId})
+        or exists (select 1 from ${schema.comment} where ${schema.comment.issueId} = ${schema.issue.id} and ${schema.comment.authorId} = ${schema.member.userId} and ${schema.comment.deletedAt} is null)
+        or exists (select 1 from ${schema.issueActivity} where ${schema.issueActivity.issueId} = ${schema.issue.id} and ${schema.issueActivity.actorId} = ${schema.member.userId} and ${schema.issueActivity.actorType} = 'user')
+        or exists (select 1 from ${schema.reaction} where ${schema.reaction.userId} = ${schema.member.userId} and (${schema.reaction.issueId} = ${schema.issue.id} or ${schema.reaction.commentId} in (select ${schema.comment.id} from ${schema.comment} where ${schema.comment.issueId} = ${schema.issue.id} and ${schema.comment.deletedAt} is null)))
+      )
+  )`,
+  ];
+}
+
+function searchFilters(filter: IssueFilterInput): SQL[] {
+  const filters: SQL[] = [];
+  if (filter.query !== undefined && filter.query.trim().length > 0) {
+    const term = `%${filter.query.trim()}%`;
+    const matches = or(
+      ilike(schema.issue.title, term),
+      filter.view === 'standup' ? undefined : ilike(schema.issue.description, term),
+      ilike(schema.issue.identifier, term),
+    );
+    if (matches !== undefined) filters.push(matches);
+  }
+  return filters;
+}
+
+function directFilters(principal: Principal, filter: IssueFilterInput): SQL[] {
+  const filters: SQL[] = [];
+  if (filter.teamId !== undefined) filters.push(eq(schema.issue.teamId, filter.teamId));
+  if (filter.projectId !== undefined) filters.push(eq(schema.issue.projectId, filter.projectId));
+  if (filter.cycleId !== undefined) filters.push(eq(schema.issue.cycleId, filter.cycleId));
+  if (filter.milestoneId !== undefined) {
+    filters.push(eq(schema.issue.milestoneId, filter.milestoneId));
+  }
+  if (filter.assigneeId !== undefined) {
+    filters.push(
+      filter.assigneeId === UNSET_FILTER_VALUE
+        ? isNull(schema.issue.assigneeId)
+        : eq(schema.issue.assigneeId, filter.assigneeId),
+    );
+  }
+  filters.push(...participantFilters(filter.participantId, filter.workType));
+  filters.push(...agentFilters(principal, filter));
+  if (filter.stateId !== undefined) filters.push(eq(schema.issue.stateId, filter.stateId));
+  if (filter.parentId !== undefined) filters.push(eq(schema.issue.parentId, filter.parentId));
+  if (filter.stateCategory !== undefined) {
+    filters.push(
+      inArray(
+        schema.issue.stateId,
+        db
+          .select({ id: schema.workflowState.id })
+          .from(schema.workflowState)
+          .where(
+            and(
+              eq(schema.workflowState.organizationId, principal.organizationId),
+              eq(schema.workflowState.category, filter.stateCategory),
+            ),
+          ),
+      ),
+    );
+  }
+  if (filter.labelId !== undefined) {
+    filters.push(
+      inArray(
+        schema.issue.id,
+        db
+          .select({ id: schema.issueLabel.issueId })
+          .from(schema.issueLabel)
+          .where(eq(schema.issueLabel.labelId, filter.labelId)),
+      ),
+    );
+  }
+  filters.push(...searchFilters(filter));
+  if (!filter.includeArchived) filters.push(isNull(schema.issue.archivedAt));
+  if (!filter.includeSubIssues && filter.parentId === undefined) {
+    filters.push(isNull(schema.issue.parentId));
+  }
+  return filters;
+}
+
+export function buildIssueWhere(principal: Principal, input: IssueWhereInput): SQL<unknown> {
+  const filters = [
+    eq(schema.issue.organizationId, principal.organizationId),
+    ...visibilityFilters(principal, input.visibility),
+    ...directFilters(principal, input.filter),
+    ...(input.advancedFilter === 'omit'
+      ? []
+      : buildFilterFilters(input.filter.filter, {
+          now: input.now,
+          searchDescriptions: input.visibility !== 'standup',
+          ...(input.calendar === undefined ? {} : { calendar: input.calendar }),
+        })),
+  ];
+  return and(...filters) ?? sql`false`;
+}

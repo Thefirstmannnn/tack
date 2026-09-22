@@ -1,0 +1,585 @@
+import { describe, expect, it } from 'bun:test';
+import { readFile } from 'node:fs/promises';
+import { PROJECT_HEALTHS } from '@tack/shared';
+import { SYNC_MODELS } from '@tack/shared/events';
+import { randomUUIDv7 } from '@tack/shared/utils';
+import { getTableColumns, type SQL, type Table } from 'drizzle-orm';
+import { getTableConfig, PgDialect, type PgTable } from 'drizzle-orm/pg-core';
+import { db } from '../../src/index.ts';
+import * as schema from '../../src/schema/index.ts';
+
+type IndexConfig = ReturnType<typeof getTableConfig>['indexes'][number]['config'];
+
+function tableExportName(model: string): string {
+  return model.replace(/_([a-z])/g, (_match, letter: string) => letter.toUpperCase());
+}
+
+function partialIndexOf(table: PgTable, name: string): IndexConfig {
+  const config = getTableConfig(table)
+    .indexes.map((entry) => entry.config)
+    .find((entry) => entry.name === name && entry.where !== undefined);
+  if (config === undefined) throw new Error(`${name} is not a partial index on this table.`);
+  return config;
+}
+
+function predicateOf(config: IndexConfig): string {
+  const where = config.where;
+  if (where === undefined) throw new Error(`${String(config.name)} carries no predicate.`);
+  return new PgDialect().sqlToQuery(where).sql;
+}
+
+function columnNamesOf(config: IndexConfig): string[] {
+  return config.columns.map((column) => (column as { name?: string }).name ?? '');
+}
+
+function indexNamesOf(table: PgTable): string[] {
+  return getTableConfig(table)
+    .indexes.map((entry) => entry.config.name)
+    .filter((name): name is string => name !== undefined);
+}
+
+function partialIndexNamesOf(table: PgTable): string[] {
+  return getTableConfig(table)
+    .indexes.filter((entry) => entry.config.where !== undefined)
+    .map((entry) => entry.config.name)
+    .filter((name): name is string => name !== undefined);
+}
+
+function deleteActionOf(table: PgTable, column: string): string | undefined {
+  return getTableConfig(table).foreignKeys.find((key) =>
+    key.reference().columns.some((entry) => entry.name === column),
+  )?.onDelete;
+}
+
+describe('sync schema', () => {
+  it('exposes a sync id column for every synced model', () => {
+    const tables = schema as unknown as Record<string, Table | undefined>;
+    for (const model of SYNC_MODELS) {
+      const table = tables[tableExportName(model)];
+      expect(table, model).toBeDefined();
+      expect(Object.keys(getTableColumns(table as Table)), model).toContain('syncId');
+    }
+  });
+});
+
+describe('list and search indexes', () => {
+  it('orders and filters issues from partial indexes that skip archived rows', () => {
+    expect(partialIndexNamesOf(schema.issue)).toEqual(
+      expect.arrayContaining([
+        'issue_team_order_idx',
+        'issue_team_updated_idx',
+        'issue_team_created_idx',
+        'issue_milestone_idx',
+      ]),
+    );
+  });
+
+  it('searches issues and docs through gin indexes, never a scan', () => {
+    const ginIndexes = [
+      ...getTableConfig(schema.issue).indexes,
+      ...getTableConfig(schema.doc).indexes,
+    ].filter((entry) => entry.config.method === 'gin');
+    expect(ginIndexes.map((entry) => entry.config.name)).toEqual([
+      'issue_title_trgm_idx',
+      'issue_description_trgm_idx',
+      'doc_title_trgm_idx',
+      'doc_content_trgm_idx',
+      'doc_search_idx',
+    ]);
+  });
+
+  it('ranks doc search from a stored vector that weighs the title above the body', () => {
+    const vector = getTableConfig(schema.doc).columns.find(
+      (column) => column.name === 'search_vector',
+    );
+    const generated = JSON.stringify(vector?.generated?.as ?? '');
+
+    expect(vector).toBeDefined();
+    expect(generated).toContain("setweight(to_tsvector('english', coalesce(title, '')), 'A')");
+    expect(generated).toContain(
+      "setweight(to_tsvector('english', left(coalesce(content, ''), 200000)), 'B')",
+    );
+  });
+
+  it('bounds the body it indexes, so a long doc never outgrows a tsvector and becomes unsavable', () => {
+    const vector = getTableConfig(schema.doc).columns.find(
+      (column) => column.name === 'search_vector',
+    );
+
+    expect(JSON.stringify(vector?.generated?.as ?? '')).toContain("left(coalesce(content, ''),");
+  });
+
+  it('replays sprint scope changes from a partial index over cycle moves', () => {
+    const index = partialIndexOf(schema.issueActivity, 'issue_activity_cycle_moves_idx');
+    expect(columnNamesOf(index)).toEqual(['organization_id', 'created_at']);
+    expect(predicateOf(index)).toBe(`"issue_activity"."field" = 'cycleId'`);
+  });
+
+  it('creates that index from the catchup sql on the columns and predicate the schema declares', async () => {
+    const index = partialIndexOf(schema.issueActivity, 'issue_activity_cycle_moves_idx');
+    const predicate = predicateOf(index).replaceAll('"issue_activity".', '').replaceAll('"', '');
+    const catchup = await readFile(
+      new URL('../../catchup/sprint-scope-index-catchup.sql', import.meta.url),
+      'utf8',
+    );
+    const statements = [...catchup.matchAll(/create index[\s\S]*?;/g)].map((match) =>
+      match[0].replace(/\s+/g, ' '),
+    );
+    expect(statements.length).toBeGreaterThan(0);
+    for (const statement of statements) {
+      expect(statement).toContain('issue_activity_cycle_moves_idx');
+      expect(statement).toContain(`(${columnNamesOf(index).join(', ')})`);
+      expect(statement).toContain(`where ${predicate};`);
+    }
+  });
+
+  it('indexes completion attribution evidence by organization issue and time', () => {
+    const outcome = partialIndexOf(
+      schema.cycleIssueOutcome,
+      'cycle_issue_outcome_completion_attribution_idx',
+    );
+    const activity = partialIndexOf(
+      schema.issueActivity,
+      'issue_activity_assignee_attribution_idx',
+    );
+    expect(columnNamesOf(outcome)).toEqual([
+      'organization_id',
+      'issue_id',
+      'completed_at',
+      'closed_at',
+    ]);
+    expect(predicateOf(outcome)).toContain(`outcome" = 'completed'`);
+    expect(columnNamesOf(activity)).toEqual(['organization_id', 'issue_id', 'created_at']);
+    expect(predicateOf(activity)).toContain(`field" = 'assigneeId'`);
+  });
+
+  it('resolves membership and project teams from their own indexes', () => {
+    expect(indexNamesOf(schema.member)).toContain('member_user_idx');
+    expect(indexNamesOf(schema.projectTeam)).toContain('project_team_team_idx');
+    expect(indexNamesOf(schema.issueReviewer)).toEqual(
+      expect.arrayContaining(['issue_reviewer_unique', 'issue_reviewer_user_idx']),
+    );
+    expect(indexNamesOf(schema.integration)).toEqual(
+      expect.arrayContaining([
+        'integration_provider_slack_team_idx',
+        'integration_provider_external_idx',
+      ]),
+    );
+  });
+
+  it('gives each Slack team to only one Tack workspace', () => {
+    const slackTeam = partialIndexOf(schema.integration, 'integration_provider_slack_team_idx');
+    expect(slackTeam.unique).toBe(true);
+    expect(predicateOf(slackTeam)).toContain(`provider" = 'slack'`);
+    expect(predicateOf(slackTeam)).toContain('coalesce');
+  });
+
+  it('rejects duplicate legacy Slack team claims before adding uniqueness', async () => {
+    const migration = (
+      await readFile(new URL('../../drizzle/0016_secure_slack_team.sql', import.meta.url), 'utf8')
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+    const guardStart = migration.indexOf('DO $$');
+    const oldIndexDrop = migration.indexOf('DROP INDEX "integration_provider_slack_team_idx"');
+    const uniqueIndexCreation = migration.indexOf(
+      'CREATE UNIQUE INDEX "integration_provider_slack_team_idx"',
+    );
+    const effectiveSlackTeam =
+      `coalesce("integration"."config" ->> 'slackTeamId', ` +
+      `nullif("integration"."external_id", 'default'))`;
+
+    expect(guardStart).toBeGreaterThanOrEqual(0);
+    expect(oldIndexDrop).toBeGreaterThan(guardStart);
+    expect(uniqueIndexCreation).toBeGreaterThan(oldIndexDrop);
+
+    const guard = migration.slice(guardStart, oldIndexDrop);
+    expect(guard).toContain(
+      `WHERE "integration"."provider" = 'slack' AND ${effectiveSlackTeam} IS NOT NULL ` +
+        `GROUP BY ${effectiveSlackTeam} HAVING count(*) > 1`,
+    );
+    expect(guard).toContain(
+      "RAISE EXCEPTION 'Duplicate legacy Slack team claims block unique ownership. " +
+        'Keep one integration for each Slack workspace, disconnect the others, then rerun the ' +
+        "migration.';",
+    );
+  });
+
+  it('indexes source delivery lookups without indexing rows that have no source', () => {
+    const index = partialIndexOf(
+      schema.notificationDelivery,
+      'notification_delivery_source_lookup_idx',
+    );
+    expect(columnNamesOf(index)).toEqual(['source_delivery_id', 'user_id', 'channel']);
+    expect(index.unique).toBe(false);
+    expect(predicateOf(index)).toBe('"notification_delivery"."source_delivery_id" is not null');
+  });
+});
+
+describe('domain invariants', () => {
+  it('exports immutable sprint analytics facts', () => {
+    expect(schema.cycleIssueMembership).toBeDefined();
+    expect(schema.cycleIssueOutcome).toBeDefined();
+    expect(schema.cycleProgressSnapshot.isFinal).toBeDefined();
+    expect(schema.cycleProgressSnapshot.capturedAt).toBeDefined();
+    const openMembership = partialIndexOf(
+      schema.cycleIssueMembership,
+      'cycle_issue_membership_one_open_per_issue_unique',
+    );
+    expect(columnNamesOf(openMembership)).toEqual(['issue_id']);
+    expect(predicateOf(openMembership)).toBe('"cycle_issue_membership"."removed_at" is null');
+  });
+
+  it('allows closed membership intervals and rejects a second open interval', async () => {
+    const organizationId = randomUUIDv7();
+    const teamId = randomUUIDv7();
+    const cycleId = randomUUIDv7();
+    const issueId = randomUUIDv7();
+    const now = new Date('2026-08-11T00:00:00.000Z');
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.insert(schema.organization).values({
+          id: organizationId,
+          name: 'Analytics test',
+          slug: organizationId,
+        });
+        await tx.insert(schema.team).values({
+          id: teamId,
+          organizationId,
+          name: 'Analytics',
+          key: organizationId.slice(0, 8),
+        });
+        await tx.insert(schema.cycle).values({
+          id: cycleId,
+          organizationId,
+          teamId,
+          number: 1,
+          startsAt: now,
+          endsAt: new Date(now.getTime() + 86_400_000),
+        });
+        await tx.insert(schema.cycleIssueMembership).values([
+          {
+            id: randomUUIDv7(),
+            organizationId,
+            teamId,
+            cycleId,
+            issueId,
+            issueIdentifier: 'AN-1',
+            addedAt: now,
+            removedAt: now,
+            entryKind: 'planned',
+          },
+          {
+            id: randomUUIDv7(),
+            organizationId,
+            teamId,
+            cycleId,
+            issueId,
+            issueIdentifier: 'AN-1',
+            addedAt: new Date(now.getTime() + 1),
+            entryKind: 'added',
+          },
+        ]);
+        await tx.insert(schema.cycleIssueMembership).values({
+          id: randomUUIDv7(),
+          organizationId,
+          teamId,
+          cycleId,
+          issueId,
+          issueIdentifier: 'AN-1',
+          addedAt: new Date(now.getTime() + 2),
+          entryKind: 'added',
+        });
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('rejects duplicate sprint outcomes', async () => {
+    const organizationId = randomUUIDv7();
+    const teamId = randomUUIDv7();
+    const cycleId = randomUUIDv7();
+    const issueId = randomUUIDv7();
+    const now = new Date('2026-08-11T00:00:00.000Z');
+
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.insert(schema.organization).values({
+          id: organizationId,
+          name: 'Analytics test',
+          slug: organizationId,
+        });
+        await tx.insert(schema.team).values({
+          id: teamId,
+          organizationId,
+          name: 'Analytics',
+          key: organizationId.slice(0, 8),
+        });
+        await tx.insert(schema.cycle).values({
+          id: cycleId,
+          organizationId,
+          teamId,
+          number: 1,
+          startsAt: now,
+          endsAt: new Date(now.getTime() + 86_400_000),
+        });
+        const outcome = {
+          organizationId,
+          teamId,
+          cycleId,
+          issueId,
+          issueIdentifier: 'AN-1',
+          planned: true,
+          outcome: 'completed',
+          closedAt: now,
+        };
+        await tx.insert(schema.cycleIssueOutcome).values({ id: randomUUIDv7(), ...outcome });
+        await tx.insert(schema.cycleIssueOutcome).values({ id: randomUUIDv7(), ...outcome });
+      }),
+    ).rejects.toThrow();
+  });
+
+  it('records a durable workspace deletion request', () => {
+    const deletionRequestedAt = getTableColumns(schema.organization).deletionRequestedAt;
+    expect(deletionRequestedAt?.name).toBe('deletion_requested_at');
+    expect(deletionRequestedAt?.notNull).toBe(false);
+  });
+
+  it('tracks the expiration of presigned attachment targets', () => {
+    const uploadExpiresAt = getTableColumns(schema.attachment).uploadExpiresAt;
+    expect(uploadExpiresAt?.name).toBe('upload_expires_at');
+    expect(uploadExpiresAt?.default).toBeDefined();
+    expect(new PgDialect().sqlToQuery(uploadExpiresAt?.default as SQL).sql).toBe(
+      "now() + interval '900 seconds'",
+    );
+  });
+
+  it('keeps authored rows when their author is deleted', () => {
+    expect(deleteActionOf(schema.issue, 'creator_id')).toBe('restrict');
+    expect(deleteActionOf(schema.comment, 'author_id')).toBe('restrict');
+    expect(deleteActionOf(schema.doc, 'author_id')).toBe('restrict');
+    expect(deleteActionOf(schema.projectUpdate, 'author_id')).toBe('restrict');
+    expect(deleteActionOf(schema.attachment, 'uploaded_by_id')).toBe('restrict');
+  });
+
+  it('clears the issue parent link instead of orphaning it', () => {
+    expect(deleteActionOf(schema.issue, 'parent_id')).toBe('set null');
+  });
+
+  it('keeps one reaction per comment, user, and emoji', () => {
+    const index = getTableConfig(schema.reaction).indexes.find(
+      (entry) => entry.config.name === 'reaction_comment_unique',
+    );
+    expect(index?.config.unique).toBe(true);
+    expect(
+      (index?.config.columns ?? []).map((column) => (column as { name?: string }).name),
+    ).toEqual(['comment_id', 'user_id', 'emoji']);
+  });
+
+  it('scopes every soft deletable uniqueness rule to live rows', () => {
+    expect(partialIndexNamesOf(schema.team)).toContain('team_org_key_active_unique');
+    expect(partialIndexNamesOf(schema.project)).toContain('project_org_slug_active_unique');
+    expect(partialIndexNamesOf(schema.module)).toContain('module_team_name_active_unique');
+    expect(partialIndexNamesOf(schema.estimateScale)).toContain(
+      'estimate_scale_org_name_active_unique',
+    );
+    expect(partialIndexNamesOf(schema.invitation)).toContain('invitation_org_email_pending_unique');
+  });
+
+  it('names labels once per team and once per organization', () => {
+    expect(partialIndexNamesOf(schema.label)).toEqual([
+      'label_team_name_unique',
+      'label_org_name_unique',
+    ]);
+  });
+
+  it('enforces project health check constraints in the schema', () => {
+    const projectChecks = getTableConfig(schema.project).checks.map((entry) => entry.name);
+    const updateChecks = getTableConfig(schema.projectUpdate).checks.map((entry) => entry.name);
+    expect(projectChecks).toContain('project_health_check');
+    expect(updateChecks).toContain('project_update_health_check');
+  });
+
+  it('refuses project health values outside the allowed set', async () => {
+    const organizationId = randomUUIDv7();
+    let failure: unknown;
+    try {
+      await db.transaction(async (tx) => {
+        await tx.insert(schema.organization).values({
+          id: organizationId,
+          name: 'Health check org',
+          slug: organizationId,
+        });
+        await tx.insert(schema.project).values({
+          id: randomUUIDv7(),
+          organizationId,
+          name: 'Invalid project health',
+          slug: 'invalid-project-health',
+          health: 'invalid_health',
+        });
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect((failure as { cause?: { constraint_name?: string } })?.cause?.constraint_name).toBe(
+      'project_health_check',
+    );
+  });
+
+  it('refuses project update health values outside the allowed set', async () => {
+    const organizationId = randomUUIDv7();
+    const projectId = randomUUIDv7();
+    const authorId = randomUUIDv7();
+    let failure: unknown;
+    try {
+      await db.transaction(async (tx) => {
+        await tx.insert(schema.organization).values({
+          id: organizationId,
+          name: 'Health check org',
+          slug: organizationId,
+        });
+        await tx.insert(schema.user).values({
+          id: authorId,
+          name: 'Author',
+          email: `${authorId}@example.com`,
+          handle: authorId.slice(0, 16),
+        });
+        await tx.insert(schema.project).values({
+          id: projectId,
+          organizationId,
+          name: 'Health check project',
+          slug: 'health-check-project',
+          health: 'on_track',
+        });
+        await tx.insert(schema.projectUpdate).values({
+          id: randomUUIDv7(),
+          organizationId,
+          projectId,
+          authorId,
+          body: 'Update body',
+          health: 'invalid_health',
+        });
+      });
+    } catch (error) {
+      failure = error;
+    }
+    expect((failure as { cause?: { constraint_name?: string } })?.cause?.constraint_name).toBe(
+      'project_update_health_check',
+    );
+  });
+
+  it('accepts all allowed project health values', async () => {
+    const organizationId = randomUUIDv7();
+    const projectId = randomUUIDv7();
+    const authorId = randomUUIDv7();
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.insert(schema.organization).values({
+          id: organizationId,
+          name: 'Allowed health org',
+          slug: organizationId,
+        });
+        await tx.insert(schema.user).values({
+          id: authorId,
+          name: 'Author',
+          email: `${authorId}@example.com`,
+          handle: authorId.slice(0, 16),
+        });
+        for (const health of PROJECT_HEALTHS) {
+          await tx.insert(schema.project).values({
+            id: randomUUIDv7(),
+            organizationId,
+            name: `Project ${health}`,
+            slug: `project-${health}-${randomUUIDv7().slice(0, 8)}`,
+            health,
+          });
+        }
+        await tx.insert(schema.project).values({
+          id: projectId,
+          organizationId,
+          name: 'Base project',
+          slug: 'base-project',
+          health: 'on_track',
+        });
+        for (const health of PROJECT_HEALTHS) {
+          await tx.insert(schema.projectUpdate).values({
+            id: randomUUIDv7(),
+            organizationId,
+            projectId,
+            authorId,
+            body: `Update ${health}`,
+            health,
+          });
+        }
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('normalises legacy health values before adding constraints in the migration', async () => {
+    const migration = (
+      await readFile(new URL('../../drizzle/0017_typical_freak.sql', import.meta.url), 'utf8')
+    )
+      .replace(/\s+/g, ' ')
+      .trim();
+    const projectNorm = migration.indexOf(
+      "UPDATE \"project\" SET \"health\" = 'no_update' WHERE \"health\" NOT IN ('on_track', 'at_risk', 'off_track', 'no_update');",
+    );
+    const updateNorm = migration.indexOf(
+      "UPDATE \"project_update\" SET \"health\" = 'no_update' WHERE \"health\" NOT IN ('on_track', 'at_risk', 'off_track', 'no_update');",
+    );
+    const projectConstraint = migration.indexOf(
+      'ALTER TABLE "project" ADD CONSTRAINT "project_health_check"',
+    );
+    const updateConstraint = migration.indexOf(
+      'ALTER TABLE "project_update" ADD CONSTRAINT "project_update_health_check"',
+    );
+
+    expect(projectNorm).toBeGreaterThanOrEqual(0);
+    expect(updateNorm).toBeGreaterThanOrEqual(0);
+    expect(projectConstraint).toBeGreaterThan(projectNorm);
+    expect(updateConstraint).toBeGreaterThan(updateNorm);
+  });
+});
+
+describe('tables reserved for later streams', () => {
+  const reserved = [
+    schema.module,
+    schema.moduleMember,
+    schema.moduleIssue,
+    schema.moduleLink,
+    schema.cycleProgressSnapshot,
+    schema.docVersion,
+    schema.issueIdentifierAlias,
+    schema.savedAnalyticsView,
+    schema.homeWidgetPreference,
+    schema.recentVisit,
+    schema.intake,
+    schema.intakeIssue,
+    schema.estimateScale,
+    schema.estimatePoint,
+    schema.githubRepositorySync,
+    schema.githubIssueSync,
+    schema.githubCommentSync,
+    schema.githubPrStateMapping,
+    schema.slackChannelSync,
+    schema.webhook,
+    schema.webhookLog,
+  ];
+
+  it('gives every reserved table an id and a creation timestamp', () => {
+    for (const table of reserved) {
+      const config = getTableConfig(table);
+      const columns = config.columns.map((column) => column.name);
+      expect(columns, config.name).toContain('id');
+      expect(columns, config.name).toContain('created_at');
+    }
+  });
+
+  it('gives every tenant scoped reserved table an organization and a sync id', () => {
+    for (const table of reserved) {
+      const config = getTableConfig(table);
+      const columns = config.columns.map((column) => column.name);
+      if (!columns.includes('organization_id')) continue;
+      expect(columns, config.name).toContain('sync_id');
+    }
+  });
+});

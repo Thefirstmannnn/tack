@@ -1,0 +1,250 @@
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { ToastProvider } from '@/components/ui/toast.tsx';
+import { TooltipProvider } from '@/components/ui/tooltip.tsx';
+import { groupIssues } from '@/features/filters/grouping.ts';
+import { HotkeyProvider } from '@/lib/keyboard/index.ts';
+import type { Issue, WorkflowState } from '@/lib/query/schemas.ts';
+import * as issuesQuery from '@/lib/query/use-issues.ts';
+import { IssueList, SELECTION_PREFETCH_MS } from '../../../src/features/issues/issue-list.tsx';
+import type { WorkspaceData } from '../../../src/features/issues/workspace-provider.tsx';
+import * as workspaceProvider from '../../../src/features/issues/workspace-provider.tsx';
+import { restoreModulesAfterThisFile } from '../../../tests-support.ts';
+
+await restoreModulesAfterThisFile([
+  '@/features/issues/workspace-provider.tsx',
+  '@/lib/query/use-issues.ts',
+]);
+
+mock.module('next/navigation', () => ({
+  useRouter: () => ({ push: mock(), replace: mock(), refresh: mock() }),
+  usePathname: () => '/team/eng/issues',
+}));
+
+mock.module('@/lib/query/use-issues.ts', () => ({
+  ...issuesQuery,
+  useUpdateIssue: () => ({ mutate: mock(), isPending: false }),
+}));
+
+mock.module('@/features/comments/viewer-presence.tsx', () => ({
+  ViewerPresence: () => null,
+}));
+
+const todo: WorkflowState = {
+  id: 'state_todo',
+  teamId: 'team_1',
+  name: 'Todo',
+  category: 'unstarted',
+  color: '#5d6272',
+  position: 1,
+};
+
+function issue(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: 'issue_1',
+    organizationId: 'org_1',
+    teamId: 'team_1',
+    number: 1,
+    identifier: 'ENG-1',
+    title: 'Domain auto join',
+    description: '',
+    stateId: 'state_todo',
+    priority: 0,
+    creatorId: 'user_1',
+    assigneeId: null,
+    projectId: null,
+    milestoneId: null,
+    cycleId: null,
+    parentId: null,
+    estimate: null,
+    dueDate: null,
+    sortOrder: 1024,
+    startedAt: null,
+    completedAt: null,
+    canceledAt: null,
+    stateEnteredAt: '2026-01-01T00:00:00.000Z',
+    syncId: 1,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    archivedAt: null,
+    labelIds: [],
+    ...overrides,
+  };
+}
+
+const issues = [issue(), issue({ id: 'issue_2', number: 2, identifier: 'ENG-2', sortOrder: 2048 })];
+
+const workspace: WorkspaceData = {
+  ready: true,
+  userId: 'user_1',
+  role: 'admin',
+  teams: [{ id: 'team_1', name: 'Engineering', key: 'ENG', icon: 'circle', color: '#5a63c8' }],
+  states: [todo],
+  labels: [],
+  members: [],
+  projects: [],
+  cycles: [],
+  seedIssues: [],
+  stateById: new Map([[todo.id, todo]]),
+  labelById: new Map(),
+  memberById: new Map(),
+  openQuickCreate: () => undefined,
+};
+
+mock.module('../../../src/features/issues/workspace-provider.tsx', () => ({
+  ...workspaceProvider,
+  useWorkspace: () => workspace,
+}));
+
+function renderList() {
+  const groups = groupIssues(
+    issues,
+    'state',
+    { states: [todo], members: [], projects: [], cycles: [], labels: [] },
+    { showEmptyGroups: false, ordering: 'manual' },
+  );
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false, staleTime: Number.POSITIVE_INFINITY } },
+  });
+  render(
+    <QueryClientProvider client={client}>
+      <TooltipProvider>
+        <ToastProvider>
+          <HotkeyProvider>
+            <IssueList states={[todo]} groups={groups} />
+          </HotkeyProvider>
+        </ToastProvider>
+      </TooltipProvider>
+    </QueryClientProvider>,
+  );
+}
+
+describe('the first issue is active on arrival', () => {
+  it('selects without needing a j or k first', async () => {
+    const user = userEvent.setup();
+    renderList();
+
+    await user.keyboard('x');
+
+    expect(await screen.findByTestId('bulk-edit-bar')).toBeInTheDocument();
+  });
+});
+
+describe('every listed issue is a link', () => {
+  const realWidth = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetWidth');
+  const realHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'offsetHeight');
+
+  beforeAll(() => {
+    Object.defineProperty(HTMLElement.prototype, 'offsetWidth', {
+      configurable: true,
+      get: () => 900,
+    });
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+      configurable: true,
+      get: () => 600,
+    });
+  });
+
+  afterAll(() => {
+    if (realWidth !== undefined) {
+      Object.defineProperty(HTMLElement.prototype, 'offsetWidth', realWidth);
+    }
+    if (realHeight !== undefined) {
+      Object.defineProperty(HTMLElement.prototype, 'offsetHeight', realHeight);
+    }
+  });
+
+  it('points each row at its own issue page', async () => {
+    renderList();
+
+    for (const identifier of ['ENG-1', 'ENG-2']) {
+      const row = await screen.findByTestId(`issue-row-${identifier}`);
+      expect(within(row).getByRole('link').getAttribute('href')).toBe(`/issue/${identifier}`);
+    }
+  });
+
+  it('peeks the row whose title has focus when space is pressed', async () => {
+    const user = userEvent.setup();
+    renderList();
+
+    const row = await screen.findByTestId('issue-row-ENG-2');
+    within(row).getByRole('link').focus();
+    await user.keyboard('[Space]');
+
+    expect(await screen.findByTestId('issue-peek')).toHaveAttribute('aria-label', 'Peek ENG-2');
+  });
+});
+
+describe('escape on the issue list', () => {
+  it('closes the peek first and keeps the selection', async () => {
+    const user = userEvent.setup();
+    renderList();
+
+    await user.keyboard('jx');
+    expect(await screen.findByTestId('bulk-edit-bar')).toBeInTheDocument();
+
+    await user.keyboard('[Space]');
+    expect(await screen.findByTestId('issue-peek')).toBeInTheDocument();
+
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByTestId('issue-peek')).not.toBeInTheDocument());
+    expect(screen.getByTestId('bulk-edit-bar')).toBeInTheDocument();
+
+    await user.keyboard('{Escape}');
+    await waitFor(() => expect(screen.queryByTestId('bulk-edit-bar')).not.toBeInTheDocument());
+  });
+});
+
+describe('warming the issue the keyboard is sitting on', () => {
+  const realFetch = globalThis.fetch;
+  let asked: string[] = [];
+
+  function detailsAsked(): string[] {
+    return asked
+      .filter((url) => /\/api\/issues\/ENG-\d+$/.test(url))
+      .map((url) => url.split('/').at(-1) ?? '');
+  }
+
+  beforeEach(() => {
+    asked = [];
+    globalThis.fetch = ((input: RequestInfo | URL) => {
+      asked.push(typeof input === 'string' ? input : input.toString());
+      return Promise.resolve(
+        new Response(JSON.stringify({}), { headers: { 'content-type': 'application/json' } }),
+      );
+    }) as typeof fetch;
+  });
+
+  afterEach(() => {
+    cleanup();
+    globalThis.fetch = realFetch;
+  });
+
+  it('fetches the detail of the row selected on arrival', async () => {
+    renderList();
+
+    await waitFor(() => {
+      expect(detailsAsked()).toContain('ENG-1');
+    });
+  });
+
+  it('fetches the next one when the selection moves', async () => {
+    const user = userEvent.setup();
+    renderList();
+    await waitFor(() => {
+      expect(detailsAsked()).toContain('ENG-1');
+    });
+
+    await user.keyboard('j');
+
+    await waitFor(() => {
+      expect(detailsAsked()).toContain('ENG-2');
+    });
+  });
+
+  it('settles fast enough to be worth doing', () => {
+    expect(SELECTION_PREFETCH_MS).toBeLessThanOrEqual(150);
+  });
+});

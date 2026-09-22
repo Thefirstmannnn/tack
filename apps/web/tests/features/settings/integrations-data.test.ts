@@ -1,0 +1,484 @@
+import { afterAll, beforeEach, describe, expect, it } from 'bun:test';
+import { addMember, createWorkspace, resetDatabase, type Workspace } from '@tack/core/test-support';
+import { db, eq, schema } from '@tack/db';
+import { bindGithubInstallation, replaceGithubRepositories } from '@tack/services';
+import { encryptSlackBotToken } from '@tack/services/slack/credentials';
+import type { OrgRole } from '@tack/shared/constants';
+import type { Principal } from '@tack/shared/policy';
+import { randomUUIDv7 } from '@tack/shared/utils';
+import { loadGithubSettings } from '../../../src/features/settings/github-data.ts';
+import {
+  loadGithubDeliveries,
+  loadIntegrationSettings,
+} from '../../../src/features/settings/integrations-data.ts';
+
+const INSTALLATION_ID = '151887625';
+const SECRET_REPOSITORY = 'mbhatt/unannounced-acquisition';
+
+let workspace: Workspace;
+const previousAuthSecret = process.env['BETTER_AUTH_SECRET'];
+const previousSlackEnabled = process.env['SLACK_ENABLED'];
+process.env['BETTER_AUTH_SECRET'] ??= 'slack-integrations-data-test-secret';
+
+afterAll(() => {
+  if (previousAuthSecret === undefined) delete process.env['BETTER_AUTH_SECRET'];
+  else process.env['BETTER_AUTH_SECRET'] = previousAuthSecret;
+  if (previousSlackEnabled === undefined) delete process.env['SLACK_ENABLED'];
+  else process.env['SLACK_ENABLED'] = previousSlackEnabled;
+});
+
+async function seedPrivateCatalogue(): Promise<void> {
+  await db.transaction(async (tx) => {
+    const installation = await bindGithubInstallation(tx, {
+      organizationId: workspace.organizationId,
+      connectedById: workspace.adminUser.id,
+      account: {
+        installationId: INSTALLATION_ID,
+        accountLogin: 'mbhatt',
+        accountId: '192082188',
+        accountType: 'Organization',
+        repositorySelection: 'all',
+        suspended: false,
+      },
+    });
+    await replaceGithubRepositories(tx, {
+      installation,
+      repositories: [
+        {
+          repositoryId: '900712888',
+          repositoryName: SECRET_REPOSITORY,
+          name: 'unannounced-acquisition',
+          ownerLogin: 'mbhatt',
+          private: true,
+          archived: false,
+          defaultBranch: 'main',
+          htmlUrl: `https://github.com/${SECRET_REPOSITORY}`,
+        },
+      ],
+    });
+  });
+}
+
+async function principalWithRole(role: OrgRole): Promise<Principal> {
+  const { principal } = await addMember(workspace, role, { name: `${role} viewer` });
+  return principal;
+}
+
+beforeEach(async () => {
+  delete process.env['SLACK_ENABLED'];
+  await resetDatabase();
+  workspace = await createWorkspace('mbhatt');
+  await seedPrivateCatalogue();
+});
+
+describe('loadIntegrationSettings', () => {
+  it('exposes delivery diagnostics with serialized timestamps only to workspace managers', async () => {
+    process.env['SLACK_ENABLED'] = 'true';
+    const notificationId = randomUUIDv7();
+    await db.insert(schema.notification).values({
+      id: notificationId,
+      organizationId: workspace.organizationId,
+      userId: workspace.adminUser.id,
+      type: 'mention',
+      reason: 'mentioned',
+      actorType: 'system',
+      actorId: 'tack',
+      actorName: 'Tack',
+      entityType: 'project',
+      entityId: 'project-health',
+      title: 'Review requested',
+      body: 'Please review.',
+      url: '/inbox',
+    });
+    await db.insert(schema.notificationDelivery).values({
+      id: randomUUIDv7(),
+      notificationId,
+      organizationId: workspace.organizationId,
+      userId: workspace.adminUser.id,
+      channel: 'slack_dm',
+      status: 'ambiguous',
+      createdAt: new Date('2026-09-08T00:00:00.000Z'),
+    });
+    const settings = await loadIntegrationSettings(workspace.admin);
+    expect(settings.slack?.deliveryHealth).toEqual([
+      { channel: 'slack_dm', status: 'ambiguous', count: 1, oldestAt: '2026-09-08T00:00:00.000Z' },
+    ]);
+    expect(
+      (await loadIntegrationSettings(await principalWithRole('member'))).slack,
+    ).toBeUndefined();
+    expect(JSON.stringify(settings.slack?.deliveryHealth)).not.toContain(notificationId);
+  });
+  it('gives an admin the repository catalogue', async () => {
+    const settings = await loadIntegrationSettings(workspace.admin);
+
+    expect(settings.github.connected).toBe(true);
+    expect(settings.github.repositories.map((entry) => entry.fullName)).toEqual([
+      SECRET_REPOSITORY,
+    ]);
+    expect(settings.slack).toBeUndefined();
+    expect(JSON.stringify(settings)).not.toMatch(/slack/i);
+  });
+
+  it('loads only the canonical Slack integration and its channels when enabled', async () => {
+    const canonicalIntegrationId = `int_${randomUUIDv7()}`;
+    const legacyIntegrationId = `int_${randomUUIDv7()}`;
+    const teammate = await addMember(workspace, 'member', { name: 'Current Slack Member' });
+    const former = await addMember(workspace, 'member', { name: 'Former Slack Member' });
+    await db.delete(schema.member).where(eq(schema.member.userId, former.user.id));
+    await db.insert(schema.integration).values([
+      {
+        id: canonicalIntegrationId,
+        organizationId: workspace.organizationId,
+        provider: 'slack',
+        externalId: 'default',
+        connectedById: workspace.adminUser.id,
+        credentials: {
+          botToken: encryptSlackBotToken({
+            organizationId: workspace.organizationId,
+            integrationId: canonicalIntegrationId,
+            token: 'xoxb-current',
+          }),
+        },
+        config: {
+          credentialVersion: 'current-version',
+          slackTeamId: 'T-CANONICAL',
+          scopes: ['users:read', 'users:read.email'],
+        },
+        createdAt: new Date('2026-01-01T00:00:00Z'),
+      },
+      {
+        id: legacyIntegrationId,
+        organizationId: workspace.organizationId,
+        provider: 'slack',
+        externalId: 'T-LEGACY',
+        connectedById: workspace.adminUser.id,
+        credentials: {},
+        createdAt: new Date('2026-02-01T00:00:00Z'),
+      },
+    ]);
+    await db.insert(schema.slackChannelSync).values([
+      {
+        id: `slc_${randomUUIDv7()}`,
+        organizationId: workspace.organizationId,
+        integrationId: canonicalIntegrationId,
+        teamId: workspace.teamId,
+        channelId: 'C-CANONICAL',
+        channelName: 'canonical-private',
+      },
+      {
+        id: `slc_${randomUUIDv7()}`,
+        organizationId: workspace.organizationId,
+        integrationId: legacyIntegrationId,
+        teamId: workspace.teamId,
+        channelId: 'C-LEGACY',
+        channelName: 'legacy-private',
+      },
+    ]);
+    await db.insert(schema.slackUserMapping).values([
+      {
+        id: `sum_${randomUUIDv7()}`,
+        organizationId: workspace.organizationId,
+        integrationId: canonicalIntegrationId,
+        userId: workspace.adminUser.id,
+        slackUserId: 'U-CANONICAL-ADMIN',
+        slackDisplayName: 'Admin',
+      },
+      {
+        id: `sum_${randomUUIDv7()}`,
+        organizationId: workspace.organizationId,
+        integrationId: canonicalIntegrationId,
+        userId: former.user.id,
+        slackUserId: 'U-CANONICAL-FORMER',
+        slackDisplayName: 'Former',
+      },
+      {
+        id: `sum_${randomUUIDv7()}`,
+        organizationId: workspace.organizationId,
+        integrationId: legacyIntegrationId,
+        userId: teammate.user.id,
+        slackUserId: 'U-LEGACY-TEAMMATE',
+        slackDisplayName: 'Legacy',
+      },
+    ]);
+
+    process.env['SLACK_ENABLED'] = 'true';
+
+    const settings = await loadIntegrationSettings(workspace.admin);
+
+    expect(settings.slack?.slackConnected).toBe(true);
+    expect(settings.slack?.slackHasToken).toBe(true);
+    expect(settings.slack?.memberSync.ready).toBe(true);
+    expect(settings.slack?.channels.map((channel) => channel.channelId)).toEqual(['C-CANONICAL']);
+    expect(settings.slack?.memberSync).toEqual({ eligible: 2, mapped: 1, ready: true });
+  });
+
+  it('requires reconnecting before a scope-deficient Slack connection can sync members', async () => {
+    const scopeIntegrationId = `int_${randomUUIDv7()}`;
+    await db.insert(schema.integration).values({
+      id: scopeIntegrationId,
+      organizationId: workspace.organizationId,
+      provider: 'slack',
+      externalId: 'default',
+      connectedById: workspace.adminUser.id,
+      credentials: {
+        botToken: encryptSlackBotToken({
+          organizationId: workspace.organizationId,
+          integrationId: scopeIntegrationId,
+          token: 'xoxb-legacy',
+        }),
+      },
+      config: {
+        credentialVersion: 'legacy-version',
+        slackTeamId: 'T-LEGACY',
+        scopes: ['chat:write'],
+      },
+    });
+    process.env['SLACK_ENABLED'] = 'true';
+
+    const settings = await loadIntegrationSettings(workspace.admin);
+
+    expect(settings.slack?.memberSync.ready).toBe(false);
+  });
+
+  it('requires reconnecting when the stored Slack token cannot be decrypted', async () => {
+    const integrationId = `int_${randomUUIDv7()}`;
+    const activeSecret = process.env['BETTER_AUTH_SECRET'];
+    if (activeSecret === undefined) throw new Error('Expected an active auth secret.');
+    const retiredToken = (() => {
+      process.env['BETTER_AUTH_SECRET'] = 'retired-slack-integrations-data-secret';
+      try {
+        return encryptSlackBotToken({
+          organizationId: workspace.organizationId,
+          integrationId,
+          token: 'xoxb-retired',
+        });
+      } finally {
+        process.env['BETTER_AUTH_SECRET'] = activeSecret;
+      }
+    })();
+    await db.insert(schema.integration).values({
+      id: integrationId,
+      organizationId: workspace.organizationId,
+      provider: 'slack',
+      externalId: 'default',
+      connectedById: workspace.adminUser.id,
+      credentials: { botToken: retiredToken },
+      config: {
+        credentialVersion: 'retired-version',
+        slackTeamId: 'T-RETIRED',
+        scopes: ['users:read', 'users:read.email'],
+      },
+    });
+    process.env['SLACK_ENABLED'] = 'true';
+
+    const settings = await loadIntegrationSettings(workspace.admin);
+
+    expect(settings.slack?.memberSync.ready).toBe(false);
+  });
+
+  for (const readinessCase of [
+    {
+      name: 'requires reconnecting when Slack explicitly marks the connection for reauthorization',
+      config: {
+        credentialVersion: 'reauthorize-version',
+        slackTeamId: 'T-REAUTHORIZE',
+        scopes: ['users:read', 'users:read.email'],
+        slackReauthorize: true,
+      },
+    },
+    {
+      name: 'keeps member sync unavailable when the Slack team id is missing',
+      config: {
+        credentialVersion: 'missing-team-version',
+        scopes: ['users:read', 'users:read.email'],
+      },
+    },
+    {
+      name: 'keeps member sync unavailable when the Slack team id is empty',
+      config: {
+        credentialVersion: 'empty-team-version',
+        slackTeamId: '',
+        scopes: ['users:read', 'users:read.email'],
+      },
+    },
+  ] as const) {
+    it(readinessCase.name, async () => {
+      const integrationId = `int_${randomUUIDv7()}`;
+      await db.insert(schema.integration).values({
+        id: integrationId,
+        organizationId: workspace.organizationId,
+        provider: 'slack',
+        externalId: 'default',
+        connectedById: workspace.adminUser.id,
+        credentials: {
+          botToken: encryptSlackBotToken({
+            organizationId: workspace.organizationId,
+            integrationId,
+            token: 'xoxb-readiness',
+          }),
+        },
+        config: readinessCase.config,
+      });
+      process.env['SLACK_ENABLED'] = 'true';
+
+      const settings = await loadIntegrationSettings(workspace.admin);
+
+      expect(settings.slack?.memberSync.ready).toBe(false);
+    });
+  }
+
+  for (const role of ['guest', 'contributor', 'member'] as const) {
+    it(`hands a ${role} no repository name at all`, async () => {
+      const principal = await principalWithRole(role);
+
+      const settings = await loadIntegrationSettings(principal);
+
+      expect(settings.github.repositories).toEqual([]);
+      expect(settings.github.installations).toEqual([]);
+      expect(settings.github.connected).toBe(false);
+      expect(JSON.stringify(settings)).not.toContain('unannounced-acquisition');
+      expect(JSON.stringify(settings)).not.toContain(INSTALLATION_ID);
+    });
+  }
+
+  it('withholds workspace integration details from anyone who cannot manage integrations', async () => {
+    const principal = await principalWithRole('member');
+
+    const settings = await loadIntegrationSettings(principal);
+
+    expect(settings.github.repositories).toEqual([]);
+    expect(JSON.stringify(settings)).not.toMatch(/slack/i);
+  });
+});
+
+describe('loadGithubSettings', () => {
+  it('refuses outright when the caller cannot manage integrations', async () => {
+    const principal = await principalWithRole('guest');
+
+    await expect(loadGithubSettings(principal)).rejects.toThrow(/integration manage/);
+  });
+
+  it('refuses a forced refresh from a member as well as a read', async () => {
+    const principal = await principalWithRole('member');
+
+    await expect(loadGithubSettings(principal, { refresh: true })).rejects.toThrow(
+      /integration manage/,
+    );
+  });
+
+  it('still serves an admin', async () => {
+    const settings = await loadGithubSettings(workspace.admin);
+
+    expect(settings.repositories.map((entry) => entry.fullName)).toEqual([SECRET_REPOSITORY]);
+  });
+});
+describe('loadGithubDeliveries', () => {
+  async function recordDelivery(overrides: {
+    readonly id: string;
+    readonly provider?: string;
+    readonly event?: string;
+    readonly status?: string;
+    readonly error?: string | null;
+    readonly createdAt?: Date;
+    readonly organizationId?: string;
+  }): Promise<void> {
+    await db.insert(schema.webhookDelivery).values({
+      id: overrides.id,
+      provider: overrides.provider ?? 'github',
+      deliveryId: `delivery-${overrides.id}`,
+      event: overrides.event ?? 'pull_request',
+      status: overrides.status ?? 'processed',
+      error: overrides.error ?? null,
+      organizationId: overrides.organizationId ?? workspace.organizationId,
+      createdAt: overrides.createdAt ?? new Date('2026-01-01T00:00:00.000Z'),
+    });
+  }
+
+  it('never hands one workspace the delivery log of another', async () => {
+    const neighbour = await createWorkspace('somebody-else');
+    await recordDelivery({ id: 'mine' });
+    await recordDelivery({ id: 'theirs', organizationId: neighbour.organizationId });
+
+    const deliveries = await loadGithubDeliveries(workspace.admin);
+
+    expect(deliveries.map((entry) => entry.id)).toEqual(['mine']);
+    expect(await loadGithubDeliveries(neighbour.admin)).toHaveLength(1);
+  });
+
+  it('leaves a delivery nobody could attribute out of every workspace', async () => {
+    await recordDelivery({ id: 'mine' });
+    await recordDelivery({ id: 'unattributed' });
+    await db
+      .update(schema.webhookDelivery)
+      .set({ organizationId: null })
+      .where(eq(schema.webhookDelivery.id, 'unattributed'));
+
+    const deliveries = await loadGithubDeliveries(workspace.admin);
+
+    expect(deliveries.map((entry) => entry.id)).toEqual(['mine']);
+  });
+
+  it('gives an admin the deliveries that arrived', async () => {
+    await recordDelivery({ id: 'del_1', status: 'ignored', error: 'no_issue_identifier' });
+
+    const deliveries = await loadGithubDeliveries(workspace.admin);
+
+    expect(deliveries).toHaveLength(1);
+    expect(deliveries[0]?.status).toBe('ignored');
+    expect(deliveries[0]?.reason).toBe('no_issue_identifier');
+    expect(deliveries[0]?.event).toBe('pull_request');
+  });
+
+  for (const role of ['member', 'guest'] as const) {
+    it(`tells a ${role} nothing, because a delivery log is not theirs to read`, async () => {
+      await recordDelivery({ id: 'del_1' });
+      const principal = await principalWithRole(role);
+
+      expect(await loadGithubDeliveries(principal)).toEqual([]);
+    });
+  }
+
+  it('leaves another provider out rather than calling its delivery a GitHub one', async () => {
+    await recordDelivery({ id: 'del_github' });
+    await recordDelivery({ id: 'del_slack', provider: 'slack', event: 'message' });
+
+    const deliveries = await loadGithubDeliveries(workspace.admin);
+
+    expect(deliveries.map((entry) => entry.id)).toEqual(['del_github']);
+  });
+
+  it('puts the newest delivery first, because that is the one being diagnosed', async () => {
+    await recordDelivery({ id: 'older', createdAt: new Date('2026-01-01T00:00:00.000Z') });
+    await recordDelivery({ id: 'newest', createdAt: new Date('2026-03-01T00:00:00.000Z') });
+    await recordDelivery({ id: 'middle', createdAt: new Date('2026-02-01T00:00:00.000Z') });
+
+    const deliveries = await loadGithubDeliveries(workspace.admin);
+
+    expect(deliveries.map((entry) => entry.id)).toEqual(['newest', 'middle', 'older']);
+  });
+
+  it('stops at twenty, so one busy hour cannot bury the panel', async () => {
+    for (let index = 0; index < 25; index += 1) {
+      await recordDelivery({
+        id: `del_${index}`,
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, index)),
+      });
+    }
+
+    const deliveries = await loadGithubDeliveries(workspace.admin);
+
+    expect(deliveries).toHaveLength(20);
+    expect(deliveries[0]?.id).toBe('del_24');
+  });
+
+  it('hands the arrival time over as an ISO string the client can parse', async () => {
+    await recordDelivery({ id: 'del_1', createdAt: new Date('2026-05-04T09:30:00.000Z') });
+
+    const deliveries = await loadGithubDeliveries(workspace.admin);
+
+    expect(deliveries[0]?.receivedAt).toBe('2026-05-04T09:30:00.000Z');
+    expect(new Date(deliveries[0]?.receivedAt ?? '').toISOString()).toBe(
+      '2026-05-04T09:30:00.000Z',
+    );
+  });
+});

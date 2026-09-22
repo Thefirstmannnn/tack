@@ -1,0 +1,232 @@
+import { afterAll, beforeEach, describe, expect, it, mock } from 'bun:test';
+import { render, screen, waitFor } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { restoreModulesAfterThisFile } from '../../../tests-support.ts';
+
+const requestPasswordReset = mock();
+const sendVerificationOtp = mock();
+const signInEmailOtp = mock();
+const signInSocial = mock();
+const toast = mock();
+const originalLocation = window.location;
+const assign = mock();
+
+await restoreModulesAfterThisFile(['@/components/ui/toast.tsx']);
+
+Object.defineProperty(window, 'location', {
+  configurable: true,
+  value: { ...window.location, origin: 'https://tack-abc123-YOUR_DOMAIN', assign },
+});
+
+mock.module('@/lib/auth/client.ts', () => ({
+  authClient: {
+    requestPasswordReset: (...args: unknown[]) => requestPasswordReset(...args),
+    emailOtp: {
+      sendVerificationOtp: (...args: unknown[]) => sendVerificationOtp(...args),
+    },
+    signIn: {
+      social: (...args: unknown[]) => signInSocial(...args),
+      emailOtp: (...args: unknown[]) => signInEmailOtp(...args),
+    },
+  },
+}));
+
+mock.module('@/components/ui/toast.tsx', () => ({
+  useToast: () => ({ toast, dismiss: mock() }),
+}));
+
+const { LoginForm } = await import('../../../src/components/auth/login-form.tsx');
+
+beforeEach(() => {
+  requestPasswordReset.mockReset();
+  sendVerificationOtp.mockReset();
+  signInEmailOtp.mockReset();
+  signInSocial.mockReset();
+  toast.mockReset();
+  assign.mockReset();
+});
+
+afterAll(() => {
+  Object.defineProperty(window, 'location', { configurable: true, value: originalLocation });
+});
+
+function renderForm(passwordEnabled: boolean, openSignUp = false) {
+  render(<LoginForm providers={[]} passwordEnabled={passwordEnabled} openSignUp={openSignUp} />);
+}
+
+const SIGN_UP_NOTE = 'New here? Signing in creates your account, then you set up a workspace.';
+
+describe('LoginForm', () => {
+  it('keeps successful and failed reauthentication on the requesting page', async () => {
+    signInSocial.mockResolvedValue({ error: null });
+    render(
+      <LoginForm
+        providers={['google']}
+        callbackUrl="/settings/account/sessions"
+        errorCallbackUrl="/settings/account/sessions"
+      />,
+    );
+
+    await userEvent.setup().click(screen.getByText('Continue with Google'));
+
+    expect(signInSocial).toHaveBeenCalledWith({
+      provider: 'google',
+      callbackURL: '/settings/account/sessions',
+      errorCallbackURL: 'https://tack-abc123-YOUR_DOMAIN/settings/account/sessions',
+    });
+  });
+
+  it('returns social login failures to the current preview', async () => {
+    signInSocial.mockResolvedValue({ error: null });
+    render(<LoginForm providers={['google']} passwordEnabled={false} />);
+    await userEvent.setup().click(screen.getByText('Continue with Google'));
+    expect(signInSocial).toHaveBeenCalledWith(
+      expect.objectContaining({
+        provider: 'google',
+        errorCallbackURL: 'https://tack-abc123-YOUR_DOMAIN/login',
+      }),
+    );
+  });
+
+  it('renders no password field while password auth is off', () => {
+    renderForm(false);
+    expect(screen.queryByLabelText('Password')).toBeNull();
+    expect(screen.queryByText('Create an account with a password')).toBeNull();
+    expect(screen.getByLabelText('Email address')).toBeDefined();
+    expect(screen.getByText('Continue with passkey')).toBeDefined();
+  });
+
+  it('offers sign in and sign up once password auth is on', () => {
+    renderForm(true);
+    const password = screen.getByLabelText('Password');
+    expect(password).toHaveAttribute('type', 'password');
+    expect(password).toHaveAttribute('minlength', '12');
+    expect(screen.getByText('Sign in with password')).toBeDefined();
+    expect(screen.getByText('Create an account with a password')).toBeDefined();
+    expect(screen.getByText('Email me a code')).toBeDefined();
+    expect(screen.getByText('Continue with passkey')).toBeDefined();
+  });
+
+  it('says signing in creates an account when signup is open', () => {
+    renderForm(false, true);
+    expect(screen.getByText(SIGN_UP_NOTE)).toBeDefined();
+  });
+
+  it('stays quiet about signing up on a domain restricted instance', () => {
+    renderForm(false, false);
+    expect(screen.queryAllByText(SIGN_UP_NOTE).length).toBe(0);
+  });
+
+  it('drops the note once the user is explicitly creating an account', async () => {
+    const user = userEvent.setup();
+    renderForm(true, true);
+    expect(screen.getByText(SIGN_UP_NOTE)).toBeDefined();
+
+    await user.click(screen.getByText('Create an account with a password'));
+    expect(screen.queryAllByText(SIGN_UP_NOTE).length).toBe(0);
+  });
+
+  it('hides the forgot password affordance while password auth is off', () => {
+    renderForm(false);
+    expect(screen.queryByText('Forgot password?')).toBeNull();
+  });
+
+  it('offers a forgot password link once password auth is on', () => {
+    renderForm(true);
+    expect(screen.getByText('Forgot password?')).toBeDefined();
+  });
+
+  it('requests a password reset for the entered email', async () => {
+    requestPasswordReset.mockResolvedValue({ error: null });
+    const user = userEvent.setup();
+    renderForm(true);
+
+    await user.type(screen.getByLabelText('Email address'), 'ada@tack.local');
+    await user.click(screen.getByText('Forgot password?'));
+
+    await waitFor(() => {
+      expect(requestPasswordReset).toHaveBeenCalledWith({
+        email: 'ada@tack.local',
+        redirectTo: '/reset-password',
+      });
+    });
+  });
+
+  it('sends a sign in code to the entered email', async () => {
+    sendVerificationOtp.mockResolvedValue({ error: null });
+    const user = userEvent.setup();
+    renderForm(false);
+
+    await user.type(screen.getByLabelText('Email address'), 'ada@tack.local');
+    await user.click(screen.getByText('Email me a code'));
+
+    await waitFor(() => {
+      expect(sendVerificationOtp).toHaveBeenCalledWith({
+        email: 'ada@tack.local',
+        type: 'sign-in',
+      });
+    });
+    expect(screen.getByLabelText('Sign in code')).toBeDefined();
+    expect(screen.getByText('Verify code')).toBeDefined();
+  });
+
+  it('shows an error for an invalid emailed code', async () => {
+    sendVerificationOtp.mockResolvedValue({ error: null });
+    signInEmailOtp.mockResolvedValue({ error: { message: 'Invalid code' } });
+    const user = userEvent.setup();
+    renderForm(false);
+
+    await user.type(screen.getByLabelText('Email address'), 'ada@tack.local');
+    await user.click(screen.getByText('Email me a code'));
+    await user.type(await screen.findByLabelText('Sign in code'), '123456');
+    await user.click(screen.getByText('Verify code'));
+
+    await waitFor(() => {
+      expect(signInEmailOtp).toHaveBeenCalledWith({
+        email: 'ada@tack.local',
+        otp: '123456',
+      });
+    });
+    expect(toast).toHaveBeenCalledWith({
+      title: 'Sign in failed',
+      description: 'Invalid code',
+      tone: 'danger',
+    });
+  });
+
+  it('signs in with a valid emailed code', async () => {
+    sendVerificationOtp.mockResolvedValue({ error: null });
+    signInEmailOtp.mockResolvedValue({ error: null });
+    const user = userEvent.setup();
+    renderForm(false);
+
+    await user.type(screen.getByLabelText('Email address'), 'ada@tack.local');
+    await user.click(screen.getByText('Email me a code'));
+    await user.type(await screen.findByLabelText('Sign in code'), '123456');
+    await user.click(screen.getByText('Verify code'));
+
+    await waitFor(() => {
+      expect(assign).toHaveBeenCalledWith('/my-issues');
+    });
+    expect(signInEmailOtp).toHaveBeenCalledTimes(1);
+  });
+
+  it('verifies the code when Enter is pressed with password auth enabled', async () => {
+    sendVerificationOtp.mockResolvedValue({ error: null });
+    signInEmailOtp.mockResolvedValue({ error: { message: 'Invalid code' } });
+    const user = userEvent.setup();
+    renderForm(true);
+
+    await user.type(screen.getByLabelText('Email address'), 'ada@tack.local');
+    await user.click(screen.getByText('Email me a code'));
+    const code = await screen.findByLabelText('Sign in code');
+    await user.type(code, '123456{Enter}');
+
+    await waitFor(() => {
+      expect(signInEmailOtp).toHaveBeenCalledWith({
+        email: 'ada@tack.local',
+        otp: '123456',
+      });
+    });
+  });
+});

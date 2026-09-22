@@ -1,0 +1,355 @@
+import { beforeEach, describe, expect, it } from 'bun:test';
+import { db, eq, schema } from '@tack/db';
+import { scopes } from '@tack/shared/events';
+import { newId } from '../../src/internal.ts';
+import {
+  findPrincipal,
+  listMembers,
+  removeMember,
+  resolvePrincipal,
+  updateMemberRole,
+} from '../../src/org/member-service.ts';
+import { addTeamMember, createTeam } from '../../src/org/team-service.ts';
+import {
+  addMember,
+  createWorkspace,
+  resetDatabase,
+  type Workspace,
+} from '../../src/test-support.ts';
+import { createIssue } from '../../src/work/issue-service.ts';
+
+let workspace: Workspace;
+
+beforeEach(async () => {
+  await resetDatabase();
+  workspace = await createWorkspace('Nova');
+});
+
+async function memberIdFor(userId: string): Promise<string> {
+  const [row] = await db
+    .select()
+    .from(schema.member)
+    .where(eq(schema.member.userId, userId))
+    .limit(1);
+  if (row === undefined) throw new Error('missing member row');
+  return row.id;
+}
+
+describe('resolvePrincipal', () => {
+  it('returns the role and the team ids of the workspace', async () => {
+    const principal = await resolvePrincipal(workspace.admin.userId, workspace.organizationId);
+    expect(principal.role).toBe('admin');
+    expect(principal.teamIds).toContain(workspace.teamId);
+  });
+
+  it('refuses a user outside the workspace', async () => {
+    const outsider = await addMember(workspace, 'member');
+    await db.delete(schema.member).where(eq(schema.member.userId, outsider.user.id));
+    expect(await findPrincipal(outsider.user.id, workspace.organizationId)).toBeNull();
+    await expect(
+      resolvePrincipal(outsider.user.id, workspace.organizationId),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+  });
+
+  it('refuses normal access while workspace deletion is pending', async () => {
+    await db
+      .update(schema.organization)
+      .set({ deletionRequestedAt: new Date() })
+      .where(eq(schema.organization.id, workspace.organizationId));
+
+    await expect(
+      resolvePrincipal(workspace.admin.userId, workspace.organizationId),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+  });
+});
+
+describe('listMembers', () => {
+  it('joins the user record', async () => {
+    await addMember(workspace, 'member', { name: 'Bo Member' });
+    const members = await listMembers(workspace.admin);
+    expect(members).toHaveLength(2);
+    expect(members.every((entry) => entry.user.email.length > 0)).toBe(true);
+  });
+});
+
+describe('updateMemberRole', () => {
+  it('changes a role and returns a scoped sync action', async () => {
+    const { user } = await addMember(workspace, 'contributor');
+    const memberId = await memberIdFor(user.id);
+
+    const result = await updateMemberRole(workspace.admin, memberId, { role: 'member' });
+    expect(result.member.role).toBe('member');
+    expect(result.actions[0]?.model).toBe('member');
+    expect(result.actions[0]?.scopes).toEqual(
+      expect.arrayContaining([scopes.organization(workspace.organizationId), scopes.user(user.id)]),
+    );
+  });
+
+  it('refuses to demote the last admin', async () => {
+    const memberId = await memberIdFor(workspace.admin.userId);
+    await expect(
+      updateMemberRole(workspace.admin, memberId, { role: 'member' }),
+    ).rejects.toMatchObject({ code: 'conflict' });
+  });
+
+  it('allows demoting an admin once another admin exists', async () => {
+    const { user } = await addMember(workspace, 'admin');
+    const memberId = await memberIdFor(user.id);
+    const result = await updateMemberRole(workspace.admin, memberId, { role: 'member' });
+    expect(result.member.role).toBe('member');
+  });
+
+  it('keeps reviewer access valid when an admin is demoted', async () => {
+    const reviewer = await addMember(workspace, 'admin');
+    const { team } = await createTeam(workspace.admin, { name: 'Design', key: 'DES' });
+    await createIssue(workspace.admin, {
+      teamId: team.id,
+      title: 'Admin review',
+      reviewerIds: [reviewer.user.id],
+    });
+    const memberId = await memberIdFor(reviewer.user.id);
+
+    await expect(
+      updateMemberRole(workspace.admin, memberId, { role: 'member' }),
+    ).rejects.toMatchObject({ code: 'conflict' });
+
+    await addTeamMember(workspace.admin, team.id, { userId: reviewer.user.id });
+    const result = await updateMemberRole(workspace.admin, memberId, { role: 'member' });
+    expect(result.member.role).toBe('member');
+  });
+
+  it('stops a non admin from changing roles', async () => {
+    const { principal, user } = await addMember(workspace, 'member');
+    const memberId = await memberIdFor(user.id);
+    await expect(updateMemberRole(principal, memberId, { role: 'admin' })).rejects.toMatchObject({
+      code: 'forbidden',
+    });
+  });
+});
+
+describe('removeMember', () => {
+  it('removes the Slack identity bound to the workspace membership', async () => {
+    const { user } = await addMember(workspace, 'member');
+    const localMemberId = await memberIdFor(user.id);
+    const integrationId = newId();
+    await db.insert(schema.integration).values({
+      id: integrationId,
+      organizationId: workspace.organizationId,
+      provider: 'slack',
+      externalId: 'default',
+      connectedById: workspace.admin.userId,
+      credentials: { botToken: 'xoxb-member-removal' },
+      config: { scopes: ['chat:write', 'im:write'] },
+    });
+    await db.insert(schema.slackUserMapping).values({
+      id: newId(),
+      organizationId: workspace.organizationId,
+      integrationId,
+      userId: user.id,
+      slackUserId: 'U-REMOVED',
+      slackDisplayName: 'Removed member',
+    });
+    const other = await createWorkspace('Other');
+    await db.insert(schema.member).values({
+      id: newId(),
+      organizationId: other.organizationId,
+      userId: user.id,
+      role: 'member',
+    });
+    const otherIntegrationId = newId();
+    await db.insert(schema.integration).values({
+      id: otherIntegrationId,
+      organizationId: other.organizationId,
+      provider: 'slack',
+      externalId: 'default',
+      connectedById: other.admin.userId,
+      credentials: { botToken: 'xoxb-other-member' },
+      config: { scopes: ['chat:write', 'im:write'] },
+    });
+    await db.insert(schema.slackUserMapping).values({
+      id: newId(),
+      organizationId: other.organizationId,
+      integrationId: otherIntegrationId,
+      userId: user.id,
+      slackUserId: 'U-OTHER',
+      slackDisplayName: 'Other workspace member',
+    });
+
+    await removeMember(workspace.admin, localMemberId);
+
+    expect(
+      await db
+        .select({ organizationId: schema.slackUserMapping.organizationId })
+        .from(schema.slackUserMapping)
+        .where(eq(schema.slackUserMapping.userId, user.id)),
+    ).toEqual([{ organizationId: other.organizationId }]);
+  });
+
+  it('unassigns their open issues and drops team memberships', async () => {
+    const { user } = await addMember(workspace, 'member');
+    const { issue } = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Owned',
+      assigneeId: user.id,
+    });
+
+    const result = await removeMember(workspace.admin, await memberIdFor(user.id));
+    expect(result.reassignedIssueIds).toContain(issue.id);
+
+    const [refreshed] = await db.select().from(schema.issue).where(eq(schema.issue.id, issue.id));
+    expect(refreshed?.assigneeId).toBeNull();
+
+    const teams = await db
+      .select()
+      .from(schema.teamMember)
+      .where(eq(schema.teamMember.userId, user.id));
+    expect(teams).toHaveLength(0);
+    expect(result.actions.some((action) => action.action === 'delete')).toBe(true);
+  });
+
+  it('reassigns open issues to a replacement', async () => {
+    const leaver = await addMember(workspace, 'member');
+    const stayer = await addMember(workspace, 'member');
+    const { issue } = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Handover',
+      assigneeId: leaver.user.id,
+    });
+
+    await removeMember(workspace.admin, await memberIdFor(leaver.user.id), {
+      reassignToUserId: stayer.user.id,
+    });
+
+    const [refreshed] = await db.select().from(schema.issue).where(eq(schema.issue.id, issue.id));
+    expect(refreshed?.assigneeId).toBe(stayer.user.id);
+  });
+
+  it('removes the person from every reviewer list and publishes the changed issue', async () => {
+    const reviewer = await addMember(workspace, 'member');
+    const { issue } = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Needs a new reviewer',
+      reviewerIds: [reviewer.user.id],
+    });
+
+    const result = await removeMember(workspace.admin, await memberIdFor(reviewer.user.id));
+    const links = await db
+      .select()
+      .from(schema.issueReviewer)
+      .where(eq(schema.issueReviewer.issueId, issue.id));
+    const action = result.actions.find(
+      (entry) => entry.model === 'issue' && entry.modelId === issue.id,
+    );
+
+    expect(links).toHaveLength(0);
+    expect(action?.data['reviewerIds']).toEqual([]);
+  });
+
+  it('keeps reviewer assignments in another workspace', async () => {
+    const reviewer = await addMember(workspace, 'member');
+    const localMemberId = await memberIdFor(reviewer.user.id);
+    const { issue: localIssue } = await createIssue(workspace.admin, {
+      teamId: workspace.teamId,
+      title: 'Local review',
+      reviewerIds: [reviewer.user.id],
+    });
+    const other = await createWorkspace('Other');
+    await db.insert(schema.member).values({
+      id: newId(),
+      organizationId: other.organizationId,
+      userId: reviewer.user.id,
+      role: 'member',
+    });
+    await db.insert(schema.teamMember).values({
+      id: newId(),
+      teamId: other.teamId,
+      userId: reviewer.user.id,
+    });
+    const { issue: foreignIssue } = await createIssue(other.admin, {
+      teamId: other.teamId,
+      title: 'Foreign review',
+      reviewerIds: [reviewer.user.id],
+    });
+
+    const result = await removeMember(workspace.admin, localMemberId);
+    const links = await db
+      .select()
+      .from(schema.issueReviewer)
+      .where(eq(schema.issueReviewer.userId, reviewer.user.id));
+
+    expect(links.map((row) => row.issueId)).toEqual([foreignIssue.id]);
+    expect(links.some((row) => row.issueId === localIssue.id)).toBe(false);
+    expect(result.actions.some((action) => action.modelId === foreignIssue.id)).toBe(false);
+  });
+
+  it('refuses to remove the last admin', async () => {
+    await expect(
+      removeMember(workspace.admin, await memberIdFor(workspace.admin.userId)),
+    ).rejects.toMatchObject({ code: 'conflict' });
+  });
+});
+
+describe('removeMember kills the session', () => {
+  it('deletes every session of the removed user in the same transaction', async () => {
+    const { user } = await addMember(workspace, 'member');
+    await db.insert(schema.session).values({
+      id: newId(),
+      token: newId(),
+      userId: user.id,
+      activeOrganizationId: workspace.organizationId,
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    await removeMember(workspace.admin, await memberIdFor(user.id));
+
+    const sessions = await db
+      .select()
+      .from(schema.session)
+      .where(eq(schema.session.userId, user.id));
+    expect(sessions).toHaveLength(0);
+  });
+
+  it('leaves other people signed in', async () => {
+    const leaver = await addMember(workspace, 'member');
+    const stayer = await addMember(workspace, 'member');
+    await db.insert(schema.session).values({
+      id: newId(),
+      token: newId(),
+      userId: stayer.user.id,
+      activeOrganizationId: workspace.organizationId,
+      expiresAt: new Date(Date.now() + 3_600_000),
+    });
+
+    await removeMember(workspace.admin, await memberIdFor(leaver.user.id));
+
+    const sessions = await db
+      .select()
+      .from(schema.session)
+      .where(eq(schema.session.userId, stayer.user.id));
+    expect(sessions).toHaveLength(1);
+  });
+});
+
+describe('member agent classification', () => {
+  it('changes agent classification without demoting the last admin and publishes it', async () => {
+    const memberId = await memberIdFor(workspace.admin.userId);
+    const result = await updateMemberRole(workspace.admin, memberId, { isAgent: true });
+    expect(result.member.isAgent).toBe(true);
+    expect(result.member.role).toBe('admin');
+    expect(result.actions.find((action) => action.model === 'member')?.data['isAgent']).toBe(true);
+    const reverted = await updateMemberRole(workspace.admin, memberId, { isAgent: false });
+    expect(reverted.member.isAgent).toBe(false);
+  });
+
+  it('refuses classification by non-admins and across workspaces', async () => {
+    const member = await addMember(workspace, 'member');
+    const memberId = await memberIdFor(member.user.id);
+    await expect(
+      updateMemberRole(member.principal, memberId, { isAgent: true }),
+    ).rejects.toMatchObject({ code: 'forbidden' });
+    const other = await createWorkspace('Other');
+    await expect(updateMemberRole(other.admin, memberId, { isAgent: true })).rejects.toMatchObject({
+      code: 'not_found',
+    });
+  });
+});

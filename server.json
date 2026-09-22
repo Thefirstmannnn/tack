@@ -1,0 +1,58 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Thefirstmannnn/tack",
+  "title": "Tack",
+  "description": "Task management for people and AI agents, with scoped OAuth access to issues, projects, and docs.",
+  "repository": {
+    "url": "https://github.com/Thefirstmannnn/tack",
+    "source": "github",
+    "id": "1308968229",
+    "subfolder": "packages/mcp-server"
+  },
+  "websiteUrl": "https://YOUR_DOMAIN",
+  "icons": [
+    {
+      "src": "https://raw.githubusercontent.com/Thefirstmannnn/tack/main/apps/web/public/logo.png",
+      "mimeType": "image/png",
+      "sizes": ["512x512"]
+    }
+  ],
+  "version": "0.1.0",
+  "remotes": [
+    {
+      "type": "streamable-http",
+      "url": "https://YOUR_DOMAIN/mcp"
+    }
+  ],
+  "_meta": {
+    "io.modelcontextprotocol.registry/publisher-provided": {
+      "publisher": "mbhatt",
+      "documentation": "https://github.com/Thefirstmannnn/tack/blob/main/docs/mcp.md",
+      "support": "https://github.com/Thefirstmannnn/tack/discussions",
+      "keywords": [
+        "task-management",
+        "project-management",
+        "issues",
+        "sprints",
+        "docs",
+        "productivity",
+        "oauth",
+        "mcp"
+      ],
+      "examples": [
+        {
+          "name": "Plan and update work",
+          "description": "Create, assign, prioritize, and update issues across teams and sprints."
+        },
+        {
+          "name": "Summarize delivery",
+          "description": "Summarize completed work, blockers, sprint progress, and project status."
+        },
+        {
+          "name": "Work with project docs",
+          "description": "Read, create, update, comment on, and attach files to Tack docs."
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,17 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Where to start contributing
+    url: https://github.com/Thefirstmannnn/tack/discussions/231
+    about: Every milestone, what is missing in each, and which issues are small enough for an hour.
+  - name: Ask a question
+    url: https://github.com/Thefirstmannnn/tack/discussions/new?category=q-a
+    about: How to run, self-host, configure or build on Tack.
+  - name: Float an idea
+    url: https://github.com/Thefirstmannnn/tack/discussions/new?category=ideas
+    about: Describe a workflow that is painful, before it has a shape. Ideas become issues once we agree what to build.
+  - name: Documentation
+    url: https://github.com/Thefirstmannnn/tack/tree/main/docs
+    about: Setup, self-hosting, architecture, keyboard shortcuts and the MCP server.
+  - name: Report a security vulnerability
+    url: https://github.com/Thefirstmannnn/tack/security/advisories/new
+    about: Please report privately. Never open a public issue for a security problem.

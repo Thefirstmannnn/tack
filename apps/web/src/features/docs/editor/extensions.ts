@@ -1,0 +1,203 @@
+import { codeLowlight } from '@tack/services/markdown';
+import { Extension, mergeAttributes, Node } from '@tiptap/core';
+import CodeBlockLowlight from '@tiptap/extension-code-block-lowlight';
+import Highlight from '@tiptap/extension-highlight';
+import Image from '@tiptap/extension-image';
+import { TaskItem, TaskList } from '@tiptap/extension-list';
+import { TableKit } from '@tiptap/extension-table';
+import { Placeholder } from '@tiptap/extensions';
+import { ReactNodeViewRenderer } from '@tiptap/react';
+import StarterKit from '@tiptap/starter-kit';
+import { CodeBlockView } from './code-block-view.tsx';
+import { calloutToneOf } from './markdown.ts';
+
+export const MENU_KEYS = ['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'] as const;
+export type MenuKey = (typeof MENU_KEYS)[number];
+
+export const Callout = Node.create({
+  name: 'callout',
+  group: 'block',
+  content: 'block+',
+  defining: true,
+
+  addAttributes() {
+    return {
+      tone: {
+        default: 'note',
+        parseHTML: (element: HTMLElement): string => element.getAttribute('data-callout') ?? 'note',
+        renderHTML: (attributes: Record<string, unknown>): Record<string, string> => ({
+          'data-callout': typeof attributes['tone'] === 'string' ? attributes['tone'] : 'note',
+        }),
+      },
+    };
+  },
+
+  parseHTML() {
+    return [{ tag: 'blockquote[data-callout]', priority: 60 }];
+  },
+
+  renderHTML({ HTMLAttributes }) {
+    return ['blockquote', mergeAttributes(HTMLAttributes, { class: 'tack-callout' }), 0];
+  },
+});
+
+export const ToggleSummary = Node.create({
+  name: 'toggleSummary',
+  content: 'inline*',
+  defining: true,
+  parseHTML() {
+    return [{ tag: 'summary' }];
+  },
+  renderHTML() {
+    return ['summary', { class: 'tack-toggle-summary' }, 0];
+  },
+});
+
+export const ToggleBlock = Node.create({
+  name: 'toggleBlock',
+  group: 'block',
+  content: 'toggleSummary block+',
+  defining: true,
+  parseHTML() {
+    return [{ tag: 'details' }];
+  },
+  renderHTML() {
+    return ['details', { class: 'tack-toggle', open: 'true' }, 0];
+  },
+});
+
+export interface MenuKeyHandlerRef {
+  current: (key: MenuKey) => boolean;
+}
+
+export const MenuKeymap = Extension.create<{ handler: MenuKeyHandlerRef | null }>({
+  name: 'tackMenuKeymap',
+  addOptions() {
+    return { handler: null };
+  },
+  addKeyboardShortcuts() {
+    const bindings: Record<string, () => boolean> = {};
+    for (const key of MENU_KEYS) {
+      bindings[key] = () => this.options.handler?.current(key) ?? false;
+    }
+    return bindings;
+  },
+});
+
+const CodeBlock = CodeBlockLowlight.extend({
+  addNodeView() {
+    return ReactNodeViewRenderer(CodeBlockView);
+  },
+});
+
+export function editorExtensions(handler: MenuKeyHandlerRef, placeholder = '') {
+  return [
+    Placeholder.configure({ placeholder, emptyEditorClass: 'tack-editor-empty' }),
+    StarterKit.configure({
+      codeBlock: false,
+      link: { openOnClick: false, autolink: true },
+      heading: { levels: [1, 2, 3, 4, 5, 6] },
+    }),
+    Highlight,
+    CodeBlock.configure({ lowlight: codeLowlight, defaultLanguage: 'ts' }),
+    TaskList,
+    TaskItem.configure({ nested: true }),
+    TableKit.configure({ table: { resizable: false } }),
+    Image.configure({
+      allowBase64: false,
+      HTMLAttributes: { loading: 'lazy', decoding: 'async' },
+    }),
+    Callout,
+    ToggleSummary,
+    ToggleBlock,
+    MenuKeymap.configure({ handler }),
+  ];
+}
+
+function markCallout(root: ParentNode): void {
+  for (const quote of root.querySelectorAll('blockquote')) {
+    const lead = quote.firstElementChild;
+    if (lead === null || lead.tagName !== 'P') continue;
+    const strong = lead.firstElementChild;
+    if (strong === null || strong.tagName !== 'STRONG') continue;
+    const tone = calloutToneOf(strong.textContent ?? '');
+    if (tone === null) continue;
+    quote.setAttribute('data-callout', tone);
+    strong.remove();
+    if ((lead.textContent ?? '').trim().length === 0) lead.remove();
+  }
+}
+
+const BLOCK_TAGS = new Set([
+  'P',
+  'UL',
+  'OL',
+  'DIV',
+  'BLOCKQUOTE',
+  'PRE',
+  'TABLE',
+  'DETAILS',
+  'FIGURE',
+  'HR',
+  'H1',
+  'H2',
+  'H3',
+  'H4',
+  'H5',
+  'H6',
+]);
+
+function isCheckbox(node: Element | null): boolean {
+  return node !== null && node.tagName === 'INPUT' && node.getAttribute('type') === 'checkbox';
+}
+
+function ownBox(item: Element): Element | null {
+  const lead = item.firstElementChild;
+  if (isCheckbox(lead)) return lead;
+  if (lead?.tagName === 'P' && isCheckbox(lead.firstElementChild)) return lead.firstElementChild;
+  return null;
+}
+
+const ELEMENT_NODE = 1;
+
+function startsABlock(node: ChildNode): boolean {
+  return node.nodeType === ELEMENT_NODE && BLOCK_TAGS.has((node as Element).tagName);
+}
+
+function wrapLeadingText(item: Element): void {
+  const paragraph = item.ownerDocument.createElement('p');
+  while (item.firstChild !== null && !startsABlock(item.firstChild)) {
+    paragraph.append(item.firstChild);
+  }
+  if ((paragraph.textContent ?? '').trim().length === 0 && item.firstElementChild !== null) {
+    item.prepend(...paragraph.childNodes);
+    return;
+  }
+  item.prepend(paragraph);
+}
+
+function markTaskLists(root: ParentNode): void {
+  for (const list of root.querySelectorAll('ul')) {
+    const items = [...list.children].filter((child) => child.tagName === 'LI');
+    const boxes = items.map(ownBox);
+    if (items.length === 0 || boxes.some((box) => box === null)) continue;
+
+    list.setAttribute('data-type', 'taskList');
+    items.forEach((item, index) => {
+      const box = boxes[index];
+      item.setAttribute('data-type', 'taskItem');
+      item.setAttribute('data-checked', box?.hasAttribute('checked') === true ? 'true' : 'false');
+      box?.remove();
+      wrapLeadingText(item);
+    });
+  }
+}
+
+export function toEditorHtml(html: string): string {
+  if (typeof document === 'undefined') return html;
+  const template = document.createElement('template');
+  template.innerHTML = html;
+  markCallout(template.content);
+  markTaskLists(template.content);
+  return template.innerHTML;
+}

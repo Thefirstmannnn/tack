@@ -1,0 +1,332 @@
+import { randomUUID } from 'node:crypto';
+import { db, eq, inArray, schema, sql } from '@tack/db';
+import type { ClientMessage, ServerMessage, SyncAction } from '@tack/shared/events';
+import { serverMessageSchema } from '@tack/shared/events';
+import { REALTIME_TICKET_TTL_MS, signRealtimeTicket } from '@tack/shared/events/ticket';
+import { Redis } from 'ioredis';
+
+export function ticketSecret(): string {
+  return process.env['BETTER_AUTH_SECRET'] ?? 'dev-secret-change-me-in-production-0123456789abcdef';
+}
+
+export function ticketFor(member: SeedMember, organizationId?: string): string {
+  return signRealtimeTicket(
+    {
+      userId: member.userId,
+      organizationId: organizationId ?? member.organizationId,
+      sessionId: member.sessionId,
+      exp: Date.now() + REALTIME_TICKET_TTL_MS,
+    },
+    ticketSecret(),
+  );
+}
+
+const createdOrganizationIds: string[] = [];
+const createdUserIds: string[] = [];
+
+const WAIT_TIMEOUT_MS = 5_000;
+
+export function redisUrl(): string {
+  return process.env['REDIS_URL'] ?? 'redis://localhost:6380';
+}
+
+export async function createOrganization(): Promise<string> {
+  const id = `org_${randomUUID()}`;
+  await db.insert(schema.organization).values({ id, name: 'Realtime Test', slug: id });
+  createdOrganizationIds.push(id);
+  return id;
+}
+
+export async function createTeam(organizationId: string): Promise<string> {
+  const id = `team_${randomUUID()}`;
+  await db
+    .insert(schema.team)
+    .values({ id, organizationId, name: 'Team', key: id.slice(5, 10).toUpperCase() });
+  return id;
+}
+
+export interface SeedMemberOptions {
+  organizationId: string;
+  teamIds?: readonly string[];
+  role?: string;
+  expiresAt?: Date;
+  activeOrganizationId?: string | null;
+}
+
+export interface SeedMember {
+  userId: string;
+  token: string;
+  sessionId: string;
+  organizationId: string;
+  name: string;
+}
+
+export async function createMember(options: SeedMemberOptions): Promise<SeedMember> {
+  const userId = `user_${randomUUID()}`;
+  const name = `User ${userId.slice(5, 11)}`;
+  await db.insert(schema.user).values({
+    id: userId,
+    name,
+    email: `${userId}@tack.test`,
+    handle: userId,
+  });
+  createdUserIds.push(userId);
+
+  await addMembership(userId, options.organizationId, {
+    ...(options.role === undefined ? {} : { role: options.role }),
+    ...(options.teamIds === undefined ? {} : { teamIds: options.teamIds }),
+  });
+
+  const token = `token_${randomUUID()}`;
+  const sessionId = `session_${randomUUID()}`;
+  const expiresAt = options.expiresAt ?? new Date(Date.now() + 60 * 60 * 1000);
+  await db.insert(schema.session).values({
+    id: sessionId,
+    token,
+    userId,
+    activeOrganizationId:
+      options.activeOrganizationId === undefined
+        ? options.organizationId
+        : options.activeOrganizationId,
+    expiresAt,
+  });
+
+  return { userId, token, sessionId, organizationId: options.organizationId, name };
+}
+
+export interface MembershipOptions {
+  role?: string;
+  teamIds?: readonly string[];
+  createdAt?: Date;
+}
+
+export async function addMembership(
+  userId: string,
+  organizationId: string,
+  options: MembershipOptions = {},
+): Promise<void> {
+  await db.insert(schema.member).values({
+    id: `member_${randomUUID()}`,
+    organizationId,
+    userId,
+    role: options.role ?? 'member',
+    ...(options.createdAt === undefined ? {} : { createdAt: options.createdAt }),
+  });
+
+  for (const teamId of options.teamIds ?? []) {
+    await db
+      .insert(schema.teamMember)
+      .values({ id: `team_member_${randomUUID()}`, teamId, userId });
+  }
+}
+
+export async function createIssue(
+  organizationId: string,
+  teamId: string,
+  creatorId: string,
+): Promise<string> {
+  const [team] = await db
+    .update(schema.team)
+    .set({ issueCounter: sql`${schema.team.issueCounter} + 1` })
+    .where(eq(schema.team.id, teamId))
+    .returning({ issueCounter: schema.team.issueCounter });
+  if (team === undefined) throw new Error('missing realtime test team');
+  const stateId = `state_${randomUUID()}`;
+  await db.insert(schema.workflowState).values({
+    id: stateId,
+    organizationId,
+    teamId,
+    name: `Todo ${stateId.slice(6, 12)}`,
+    category: 'unstarted',
+    color: '#5A63C8',
+  });
+  const issueId = `issue_${randomUUID()}`;
+  await db.insert(schema.issue).values({
+    id: issueId,
+    organizationId,
+    teamId,
+    number: team.issueCounter,
+    identifier: `RT-${issueId.slice(6, 12)}`,
+    title: 'Realtime issue',
+    stateId,
+    creatorId,
+  });
+  return issueId;
+}
+
+export async function cleanupFixtures(): Promise<void> {
+  if (createdOrganizationIds.length > 0) {
+    await db
+      .delete(schema.organization)
+      .where(inArray(schema.organization.id, createdOrganizationIds));
+    createdOrganizationIds.length = 0;
+  }
+  if (createdUserIds.length > 0) {
+    await db.delete(schema.user).where(inArray(schema.user.id, createdUserIds));
+    createdUserIds.length = 0;
+  }
+}
+
+export async function deleteSessionFor(userId: string): Promise<void> {
+  await db.delete(schema.session).where(eq(schema.session.userId, userId));
+}
+
+export function syncAction(overrides: Partial<SyncAction> & Pick<SyncAction, 'organizationId'>) {
+  const modelId = overrides.modelId ?? 'label_1';
+  return {
+    syncId: 1,
+    scopes: ['org:none'],
+    action: 'update',
+    model: 'label',
+    modelId,
+    data: { id: modelId, name: 'hello' },
+    actor: { type: 'user', id: 'user_1' },
+    at: new Date().toISOString(),
+    ...overrides,
+  } satisfies SyncAction;
+}
+
+export interface TestClient {
+  socket: WebSocket;
+  messages: ServerMessage[];
+  send(message: ClientMessage): void;
+  waitFor<T extends ServerMessage['type']>(
+    type: T,
+    predicate?: (message: Extract<ServerMessage, { type: T }>) => boolean,
+  ): Promise<Extract<ServerMessage, { type: T }>>;
+  waitForClose(): Promise<number>;
+  close(): void;
+}
+
+export function connectClient(
+  port: number,
+  member: SeedMember,
+  organizationId?: string,
+): Promise<TestClient> {
+  return connectWithTicket(port, ticketFor(member, organizationId));
+}
+
+export function connectWithTicket(port: number, ticket: string): Promise<TestClient> {
+  const socket = new WebSocket(`ws://127.0.0.1:${port}/api/ws`);
+  const messages: ServerMessage[] = [];
+  const listeners = new Set<() => void>();
+  let closeCode: number | undefined;
+
+  socket.addEventListener('message', (event) => {
+    const payload: unknown = event.data;
+    if (typeof payload !== 'string') return;
+    const parsed = serverMessageSchema.safeParse(JSON.parse(payload));
+    if (!parsed.success) return;
+    messages.push(parsed.data);
+    for (const listener of [...listeners]) listener();
+  });
+  socket.addEventListener('close', (event) => {
+    closeCode = event.code;
+    for (const listener of [...listeners]) listener();
+  });
+
+  const client: TestClient = {
+    socket,
+    messages,
+    send(message) {
+      socket.send(JSON.stringify(message));
+    },
+    waitFor(type, predicate) {
+      type Wanted = Extract<ServerMessage, { type: typeof type }>;
+      const find = () =>
+        messages.find(
+          (message): message is Wanted =>
+            message.type === type && (predicate === undefined || predicate(message as Wanted)),
+        );
+      const existing = find();
+      if (existing !== undefined) return Promise.resolve(existing);
+      return new Promise<Wanted>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          listeners.delete(listener);
+          reject(new Error(`timed out waiting for ${type}`));
+        }, WAIT_TIMEOUT_MS);
+        const listener = () => {
+          const found = find();
+          if (found === undefined) return;
+          clearTimeout(timer);
+          listeners.delete(listener);
+          resolve(found);
+        };
+        listeners.add(listener);
+      });
+    },
+    waitForClose() {
+      if (closeCode !== undefined) return Promise.resolve(closeCode);
+      return new Promise<number>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          listeners.delete(listener);
+          reject(new Error('timed out waiting for close'));
+        }, WAIT_TIMEOUT_MS);
+        const listener = () => {
+          if (closeCode === undefined) return;
+          clearTimeout(timer);
+          listeners.delete(listener);
+          resolve(closeCode);
+        };
+        listeners.add(listener);
+      });
+    },
+    close() {
+      socket.close();
+    },
+  };
+
+  return new Promise<TestClient>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out opening socket')), WAIT_TIMEOUT_MS);
+    socket.addEventListener(
+      'open',
+      () => {
+        clearTimeout(timer);
+        socket.send(JSON.stringify({ type: 'auth', ticket }));
+        resolve(client);
+      },
+      { once: true },
+    );
+    socket.addEventListener(
+      'error',
+      () => {
+        clearTimeout(timer);
+        reject(new Error('socket failed to open'));
+      },
+      { once: true },
+    );
+  });
+}
+
+export function maskedTextFrame(text: string): Buffer {
+  const payload = Buffer.from(text, 'utf8');
+  const mask = Buffer.from([
+    Math.floor(Math.random() * 256),
+    Math.floor(Math.random() * 256),
+    Math.floor(Math.random() * 256),
+    Math.floor(Math.random() * 256),
+  ]);
+  const masked = Buffer.alloc(payload.length);
+  for (let index = 0; index < payload.length; index += 1) {
+    const source = payload[index] ?? 0;
+    const key = mask[index % 4] ?? 0;
+    masked[index] = source ^ key;
+  }
+  const header: number[] = [0x81];
+  if (payload.length < 126) {
+    header.push(0x80 | payload.length);
+  } else {
+    header.push(0x80 | 126, (payload.length >> 8) & 0xff, payload.length & 0xff);
+  }
+  return Buffer.concat([new Uint8Array(header), new Uint8Array(mask), new Uint8Array(masked)]);
+}
+
+export function createPublisher(): Redis {
+  return new Redis(redisUrl());
+}
+
+export function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}

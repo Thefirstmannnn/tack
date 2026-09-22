@@ -1,0 +1,156 @@
+import { z } from 'zod';
+import {
+  DUPLICATE_SUGGESTIONS_MAX_COUNT,
+  ISSUE_DESCRIPTION_MAX_LENGTH,
+  ISSUE_RELATION_TYPES,
+  ISSUE_REVIEWER_MAX_COUNT,
+  PRIORITIES,
+  STATE_CATEGORIES,
+} from '../constants/index.ts';
+import { filterGroupQuerySchema, ISSUE_ORDERINGS } from '../filters/index.ts';
+import { calendarDateSchema, idSchema, titleSchema } from './common.ts';
+
+export function booleanFlag(fallback: boolean) {
+  return z
+    .union([z.boolean(), z.enum(['true', 'false', '1', '0'])])
+    .optional()
+    .transform((value) => {
+      if (value === undefined) return fallback;
+      if (typeof value === 'boolean') return value;
+      return value === 'true' || value === '1';
+    });
+}
+
+export const prioritySchema = z
+  .number()
+  .int()
+  .refine((value): value is (typeof PRIORITIES)[number] => PRIORITIES.includes(value as 0));
+
+export const issueDescriptionSchema = z.string().max(ISSUE_DESCRIPTION_MAX_LENGTH, {
+  message: 'Description must be 500,000 characters or fewer.',
+});
+
+export const issueCreateSchema = z.object({
+  teamId: idSchema,
+  title: titleSchema,
+  description: issueDescriptionSchema.default(''),
+  stateId: idSchema.optional(),
+  priority: prioritySchema.default(0),
+  assigneeId: idSchema.nullable().optional(),
+  reviewerIds: z.array(idSchema).max(ISSUE_REVIEWER_MAX_COUNT).default([]),
+  projectId: idSchema.nullable().default(null),
+  milestoneId: idSchema.nullable().default(null),
+  cycleId: idSchema.nullable().default(null),
+  parentId: idSchema.nullable().default(null),
+  estimate: z.number().int().min(0).max(100).nullable().default(null),
+  dueDate: calendarDateSchema.nullable().default(null),
+  labelIds: z.array(idSchema).max(50).default([]),
+});
+
+export const issueUpdateSchema = z
+  .object({
+    title: titleSchema,
+    description: issueDescriptionSchema,
+    stateId: idSchema,
+    priority: prioritySchema,
+    assigneeId: idSchema.nullable(),
+    reviewerIds: z.array(idSchema).max(ISSUE_REVIEWER_MAX_COUNT),
+    projectId: idSchema.nullable(),
+    milestoneId: idSchema.nullable(),
+    cycleId: idSchema.nullable(),
+    parentId: idSchema.nullable(),
+    estimate: z.number().int().min(0).max(100).nullable(),
+    dueDate: calendarDateSchema.nullable(),
+    labelIds: z.array(idSchema).max(50),
+    sortOrder: z.number(),
+  })
+  .partial();
+
+export const issueMoveSchema = z.object({
+  stateId: idSchema.optional(),
+  teamId: idSchema.optional(),
+  cycleId: idSchema.nullable().optional(),
+  projectId: idSchema.nullable().optional(),
+  assigneeId: idSchema.nullable().optional(),
+  priority: prioritySchema.optional(),
+  beforeId: idSchema.nullable().default(null),
+  afterId: idSchema.nullable().default(null),
+});
+
+export const issueBulkUpdateSchema = z.object({
+  issueIds: z.array(idSchema).min(1).max(200),
+  patch: issueUpdateSchema,
+});
+
+export const issueFilterSchema = z.object({
+  view: z.literal('standup').optional(),
+  teamId: idSchema.optional(),
+  projectId: idSchema.optional(),
+  cycleId: idSchema.optional(),
+  milestoneId: idSchema.optional(),
+  assigneeId: idSchema.optional(),
+  participantId: idSchema.optional(),
+  workType: z.enum(['all', 'reviewing', 'assigned']).default('all'),
+  aiOnly: booleanFlag(false),
+  stateId: idSchema.optional(),
+  stateCategory: z.enum(STATE_CATEGORIES).optional(),
+  labelId: idSchema.optional(),
+  parentId: idSchema.optional(),
+  query: z.string().max(200).optional(),
+  includeArchived: booleanFlag(false),
+  includeSubIssues: booleanFlag(true),
+  orderBy: z.enum(ISSUE_ORDERINGS).default('manual'),
+  filter: filterGroupQuerySchema,
+});
+
+export const ISSUE_SUMMARY_GROUPS = [
+  'state',
+  'assignee',
+  'creator',
+  'priority',
+  'estimate',
+  'label',
+  'project',
+  'cycle',
+  'milestone',
+  'participant',
+] as const;
+
+export type IssueSummaryGroup = (typeof ISSUE_SUMMARY_GROUPS)[number];
+
+const ISSUE_SUMMARY_INPUT_GROUPS = [...ISSUE_SUMMARY_GROUPS, 'none'] as const;
+
+export const issueSummaryQuerySchema = issueFilterSchema.extend({
+  groupBy: z
+    .enum(ISSUE_SUMMARY_INPUT_GROUPS)
+    .optional()
+    .transform(
+      (value): IssueSummaryGroup => (value === undefined || value === 'none' ? 'state' : value),
+    ),
+});
+
+export const issueRelationSchema = z.object({
+  relatedIssueId: idSchema,
+  type: z.enum(ISSUE_RELATION_TYPES),
+});
+
+export const issueSubscribeSchema = z.object({ subscribed: z.boolean().default(true) });
+
+export const issueRefSchema = z.string().trim().min(1).max(128);
+
+export const duplicateIssueQuerySchema = z.object({
+  teamId: idSchema,
+  title: z.string().trim().min(1).max(256),
+  limit: z.coerce
+    .number()
+    .int()
+    .min(1)
+    .max(DUPLICATE_SUGGESTIONS_MAX_COUNT)
+    .default(DUPLICATE_SUGGESTIONS_MAX_COUNT),
+});
+
+export type IssueCreateInput = z.infer<typeof issueCreateSchema>;
+export type IssueUpdateInput = z.infer<typeof issueUpdateSchema>;
+export type IssueFilterInput = z.infer<typeof issueFilterSchema>;
+export type IssueSummaryQuery = z.infer<typeof issueSummaryQuerySchema>;
+export type DuplicateIssueQueryInput = z.infer<typeof duplicateIssueQuerySchema>;

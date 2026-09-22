@@ -1,0 +1,328 @@
+import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import userEvent from '@testing-library/user-event';
+import { type ReactNode, useEffect, useState } from 'react';
+import { CommandPalette } from '@/components/command-palette.tsx';
+import { ShortcutsOverlay } from '@/components/shortcuts-overlay.tsx';
+import {
+  HOTKEY_PRIORITY,
+  HotkeyProvider,
+  useHotkey,
+  useHotkeyRegistry,
+} from '@/lib/keyboard/index.ts';
+import { buildNavigation } from '@/lib/navigation.ts';
+import { fireEvent, render, screen } from '@/test/render.tsx';
+
+const push = mock();
+const setTheme = mock();
+
+mock.module('next/navigation', () => ({
+  useRouter: () => ({ push, replace: mock(), refresh: mock() }),
+  usePathname: () => '/inbox',
+}));
+
+mock.module('next-themes', () => ({
+  useTheme: () => ({ resolvedTheme: 'dark', setTheme }),
+}));
+
+const sections = buildNavigation([{ id: 'team_1', key: 'ENG', name: 'Engineering' }]);
+
+const noop = () => undefined;
+
+function Palette({
+  startOpen = false,
+  onToggleSidebar = noop,
+  onShowShortcuts = noop,
+  children,
+}: {
+  readonly startOpen?: boolean;
+  readonly onToggleSidebar?: () => void;
+  readonly onShowShortcuts?: () => void;
+  readonly children?: ReactNode;
+}) {
+  const [open, setOpen] = useState(startOpen);
+  return (
+    <HotkeyProvider>
+      <CommandPalette
+        open={open}
+        onOpenChange={setOpen}
+        sections={sections}
+        onToggleSidebar={onToggleSidebar}
+        onShowShortcuts={onShowShortcuts}
+      />
+      {children}
+    </HotkeyProvider>
+  );
+}
+
+function CreateIssue({ run }: { readonly run: () => void }) {
+  useHotkey('c', run, { label: 'Create issue', section: 'Issues' });
+  return null;
+}
+
+function NewDoc({ run }: { readonly run: () => void }) {
+  useHotkey('c', run, {
+    label: 'New doc',
+    section: 'Navigation',
+    scope: 'docs',
+    priority: HOTKEY_PRIORITY.surface,
+  });
+  return null;
+}
+
+function ArchiveIssue({ enabled }: { readonly enabled: boolean }) {
+  useHotkey('shift+a', noop, { label: 'Archive issue', section: 'Issues', enabled });
+  return null;
+}
+
+function CompetingSingleKey({ run }: { readonly run: () => void }) {
+  useHotkey('t', run, {
+    label: 'A surface binding on the same key',
+    section: 'Issues',
+    scope: 'issues',
+    priority: HOTKEY_PRIORITY.surface,
+  });
+  return null;
+}
+
+function SeedManyShortcuts({ count }: { readonly count: number }) {
+  const registry = useHotkeyRegistry();
+  useEffect(() => {
+    const disposers = Array.from({ length: count }, (_, index) =>
+      registry.register({
+        id: `seed-shortcut-${index}`,
+        binding: `ctrl+shift+${index}`,
+        label: `Overflow shortcut ${index}`,
+        section: 'General',
+        scope: 'global',
+        priority: HOTKEY_PRIORITY.global,
+        enabled: true,
+        advertised: true,
+        preventDefault: true,
+        allowInInput: false,
+        run: noop,
+      }),
+    );
+    return () => {
+      for (const dispose of disposers) dispose();
+    };
+  }, [registry, count]);
+  return null;
+}
+
+async function select(name: RegExp) {
+  await userEvent.setup().click(await screen.findByRole('option', { name }));
+}
+
+beforeEach(() => {
+  push.mockClear();
+  setTheme.mockClear();
+});
+
+describe('command palette', () => {
+  it('opens on its own binding and lists every navigable surface', async () => {
+    const user = userEvent.setup();
+    render(<Palette />);
+
+    await user.keyboard('{Meta>}k{/Meta}');
+
+    for (const label of [
+      /Go to Inbox/,
+      /Go to My issues/,
+      /Go to Projects/,
+      /Go to Sprints/,
+      /Go to Views/,
+      /Go to Analytics/,
+      /Go to Docs/,
+      /Go to Engineering issues/,
+      /Go to Engineering board/,
+      /Go to Settings/,
+    ]) {
+      expect(await screen.findByRole('option', { name: label })).toBeInTheDocument();
+    }
+  });
+
+  it('routes the same way whether the command is run or the binding is pressed', async () => {
+    const user = userEvent.setup();
+    render(<Palette startOpen />);
+
+    await select(/Go to Inbox/);
+    expect(push).toHaveBeenCalledWith('/inbox');
+
+    push.mockClear();
+    await user.keyboard('gi');
+    expect(push).toHaveBeenCalledWith('/inbox');
+  });
+
+  it('routes to sprints when the binding gt is pressed, even with a competing t binding', async () => {
+    const user = userEvent.setup();
+    const competing = mock();
+
+    render(
+      <Palette startOpen>
+        <CompetingSingleKey run={competing} />
+      </Palette>,
+    );
+
+    await select(/Go to Sprints/);
+    expect(push).toHaveBeenCalledWith('/sprints');
+
+    push.mockClear();
+
+    await user.keyboard('t');
+    expect(competing).toHaveBeenCalledTimes(1);
+
+    competing.mockClear();
+
+    await user.keyboard('gt');
+    expect(push).toHaveBeenCalledWith('/sprints');
+    expect(competing).not.toHaveBeenCalled();
+  });
+
+  it('runs the toggles it advertises', async () => {
+    const toggleSidebar = mock();
+    const showShortcuts = mock();
+    render(<Palette startOpen onToggleSidebar={toggleSidebar} onShowShortcuts={showShortcuts} />);
+
+    await select(/Switch to light theme/);
+    expect(setTheme).toHaveBeenCalledWith('light');
+
+    await userEvent.setup().keyboard('[[');
+    expect(toggleSidebar).toHaveBeenCalled();
+
+    await userEvent.setup().keyboard('?');
+    expect(showShortcuts).toHaveBeenCalled();
+  });
+
+  it('leaves the binding to a focused editor', async () => {
+    const user = userEvent.setup();
+    render(
+      <Palette>
+        <textarea aria-label="Description" />
+      </Palette>,
+    );
+
+    await user.click(screen.getByLabelText('Description'));
+    await user.keyboard('{Meta>}k{/Meta}');
+
+    expect(screen.queryByPlaceholderText('Type a command or search')).not.toBeInTheDocument();
+  });
+
+  it('runs a context command through the handler that owns its binding', async () => {
+    const create = mock();
+    render(
+      <Palette startOpen>
+        <CreateIssue run={create} />
+      </Palette>,
+    );
+
+    await select(/Create issue/);
+    expect(create).toHaveBeenCalled();
+  });
+
+  it('drops the key from a command whose binding another surface has taken', async () => {
+    render(
+      <Palette startOpen>
+        <CreateIssue run={noop} />
+        <NewDoc run={noop} />
+      </Palette>,
+    );
+
+    expect(await screen.findByRole('option', { name: /New doc C/ })).toBeInTheDocument();
+    expect(screen.getByRole('option', { name: 'Create issue' })).toBeInTheDocument();
+  });
+});
+
+describe('shortcuts overlay', () => {
+  it('lists the live winner of a shared binding and hides disabled ones', async () => {
+    render(
+      <HotkeyProvider>
+        <ShortcutsOverlay open onOpenChange={noop} />
+        <CreateIssue run={noop} />
+        <NewDoc run={noop} />
+        <ArchiveIssue enabled={false} />
+      </HotkeyProvider>,
+    );
+
+    const list = await screen.findByTestId('shortcuts-sections');
+    expect(list.textContent).toContain('New doc');
+    expect(list.textContent).not.toContain('Create issue');
+    expect(list.textContent).not.toContain('Archive issue');
+  });
+
+  it('groups what it lists by section', async () => {
+    render(
+      <HotkeyProvider>
+        <ShortcutsOverlay open onOpenChange={noop} />
+        <CreateIssue run={noop} />
+        <ArchiveIssue enabled />
+      </HotkeyProvider>,
+    );
+
+    const list = await screen.findByTestId('shortcuts-sections');
+    const headings = [...list.querySelectorAll('h3')].map((node) => node.textContent);
+    expect(headings).toEqual(['Issues']);
+  });
+
+  it('uses a scroll container when the shortcut list overflows', async () => {
+    render(
+      <HotkeyProvider>
+        <SeedManyShortcuts count={30} />
+        <ShortcutsOverlay open onOpenChange={noop} />
+      </HotkeyProvider>,
+    );
+
+    const scroll = await screen.findByTestId('shortcuts-scroll');
+    expect(scroll.className).toContain('overflow-y-auto');
+    expect(screen.getByTestId('shortcuts-sections').textContent).toContain('Overflow shortcut 29');
+
+    Object.defineProperty(scroll, 'clientHeight', { configurable: true, value: 200 });
+    Object.defineProperty(scroll, 'scrollHeight', { configurable: true, value: 800 });
+    expect(scroll.scrollHeight).toBeGreaterThan(scroll.clientHeight);
+  });
+
+  it('scrolls the shortcut list with arrow keys', async () => {
+    render(
+      <HotkeyProvider>
+        <SeedManyShortcuts count={30} />
+        <ShortcutsOverlay open onOpenChange={noop} />
+      </HotkeyProvider>,
+    );
+
+    const scroll = await screen.findByTestId('shortcuts-scroll');
+    Object.defineProperty(scroll, 'clientHeight', { configurable: true, value: 200 });
+    Object.defineProperty(scroll, 'scrollHeight', { configurable: true, value: 800 });
+    scroll.scrollTop = 0;
+
+    fireEvent.keyDown(scroll, { key: 'ArrowDown' });
+    expect(scroll.scrollTop).toBe(40);
+
+    fireEvent.keyDown(scroll, { key: 'ArrowUp' });
+    expect(scroll.scrollTop).toBe(0);
+  });
+});
+
+describe('modified shortcut scrolling', () => {
+  for (const modifier of ['shiftKey', 'metaKey', 'ctrlKey', 'altKey'] as const) {
+    it(`preserves arrows with ${modifier}`, async () => {
+      render(
+        <HotkeyProvider>
+          <SeedManyShortcuts count={30} />
+          <ShortcutsOverlay open onOpenChange={noop} />
+        </HotkeyProvider>,
+      );
+      const scroll = await screen.findByTestId('shortcuts-scroll');
+      scroll.scrollTop = 80;
+      for (const key of ['ArrowUp', 'ArrowDown']) {
+        const event = new KeyboardEvent('keydown', {
+          key,
+          [modifier]: true,
+          bubbles: true,
+          cancelable: true,
+        });
+        fireEvent(scroll, event);
+        expect(scroll.scrollTop).toBe(80);
+        expect(event.defaultPrevented).toBe(false);
+      }
+    });
+  }
+});

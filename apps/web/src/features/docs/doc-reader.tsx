@@ -1,0 +1,152 @@
+'use client';
+
+import { Book, GitBranch, Link2, Users } from 'lucide-react';
+import Link from 'next/link';
+import { useState } from 'react';
+import { Avatar } from '@/components/ui/avatar.tsx';
+import { RelativeTime } from '@/components/ui/relative-time.tsx';
+import { AttachmentGallery } from '@/features/attachments/attachment-gallery.tsx';
+import { cn } from '@/lib/cn.ts';
+import type { Attachment, Doc } from '@/lib/query/schemas.ts';
+import { DocBody } from './doc-body.tsx';
+import { DocOutline } from './doc-outline.tsx';
+import type { DocHeading } from './outline.ts';
+import { readTimeMinutes, wordCount } from './outline.ts';
+import { READING_WIDTH_CLASS, useDocPreferences } from './use-doc-preferences.ts';
+import { useHashScroll } from './use-hash-scroll.ts';
+import { useScrollSpy } from './use-scroll-spy.ts';
+
+export interface DocReaderProps {
+  readonly doc: Doc;
+  readonly contentHtml: string;
+  readonly attachments: readonly Attachment[];
+  readonly author: { readonly name: string; readonly image: string | null };
+  readonly followers: number;
+  readonly collectionName: string | null;
+  readonly projectName: string | null;
+  readonly backlinks?: readonly { readonly id: string; readonly title: string }[];
+}
+
+export function DocContextRow({
+  doc,
+  collectionName,
+  projectName,
+}: {
+  readonly doc: Doc;
+  readonly collectionName: string | null;
+  readonly projectName: string | null;
+}) {
+  const binding = doc.repoBinding;
+  return (
+    <div className="flex flex-wrap items-center gap-2">
+      {collectionName === null ? null : (
+        <Pill>
+          <Book className="size-3" aria-hidden="true" />
+          {collectionName}
+        </Pill>
+      )}
+      {projectName === null ? null : <Pill>{projectName}</Pill>}
+      {binding === null ? null : (
+        <span
+          data-testid="doc-repo-pill"
+          className="inline-flex items-center gap-1.5 rounded-full border border-success/30 bg-transparent px-2.5 py-1 text-2xs text-success"
+        >
+          <GitBranch className="size-3" aria-hidden="true" />
+          Synced from <code className="font-mono">{binding.path}</code>
+        </span>
+      )}
+      <span className="text-2xs text-faint">
+        Updated <RelativeTime at={doc.updatedAt} />
+      </span>
+      <span data-testid="doc-stats" className="text-2xs text-faint tabular-nums">
+        {wordCount(doc.content).toLocaleString()} words · {readTimeMinutes(doc.content)} min read
+      </span>
+    </div>
+  );
+}
+
+export function DocBacklinks({
+  backlinks = [],
+}: {
+  readonly backlinks?: readonly { readonly id: string; readonly title: string }[];
+}) {
+  if (backlinks.length === 0) return null;
+  return (
+    <section data-testid="doc-backlinks" className="mt-10 border-border border-t pt-5">
+      <h2 className="mb-2 font-medium text-2xs text-faint uppercase tracking-wide">Linked from</h2>
+      <ul className="flex flex-col gap-1">
+        {backlinks.map((entry) => (
+          <li key={entry.id}>
+            <Link
+              href={`/docs/${entry.id}`}
+              className="flex items-center gap-2 text-dense text-muted transition-colors duration-[var(--duration-fast)] hover:text-text"
+            >
+              <Link2 className="size-3.5 shrink-0" aria-hidden="true" />
+              <span className="truncate">{entry.title}</span>
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+function Pill({ children }: { children: React.ReactNode }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-border bg-surface px-2.5 py-1 text-2xs text-muted">
+      {children}
+    </span>
+  );
+}
+
+export function DocReader({
+  doc,
+  contentHtml,
+  attachments,
+  author,
+  followers,
+  collectionName,
+  projectName,
+  backlinks = [],
+}: DocReaderProps) {
+  const { width } = useDocPreferences();
+  const [headings, setHeadings] = useState<DocHeading[]>([]);
+  const activeId = useScrollSpy(headings);
+  useHashScroll(`${doc.id}:${headings.map((heading) => heading.id).join('|')}`);
+
+  return (
+    <article
+      className={cn(
+        'mx-auto flex w-full gap-6 px-8 pt-10 pb-24',
+        width === 'comfortable' ? READING_WIDTH_CLASS.wide : READING_WIDTH_CLASS[width],
+      )}
+      data-testid="doc-reader"
+      data-reading-width={width}
+    >
+      <div className={cn('min-w-0 flex-1', width === 'comfortable' && 'xl:max-w-[45rem]')}>
+        <DocContextRow doc={doc} collectionName={collectionName} projectName={projectName} />
+
+        <h1 className="mt-5 font-semibold text-4xl text-text tracking-tight">{doc.title}</h1>
+
+        <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 border-border border-b pb-6 text-2xs text-faint">
+          <span className="flex items-center gap-1.5">
+            <Avatar name={author.name} src={author.image} size="sm" />
+            <span className="text-muted">{author.name}</span>
+          </span>
+          <span aria-hidden="true">·</span>
+          <span className="flex items-center gap-1">
+            <Users className="size-3" aria-hidden="true" />
+            {followers} following
+          </span>
+        </div>
+
+        <DocBody html={contentHtml} onHeadings={setHeadings} className="mt-8" />
+        <AttachmentGallery attachments={attachments} />
+
+        <DocBacklinks backlinks={backlinks} />
+      </div>
+
+      <DocOutline headings={headings} activeId={activeId} />
+    </article>
+  );
+}

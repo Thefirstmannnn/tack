@@ -1,0 +1,119 @@
+import { afterEach, describe, expect, it } from 'bun:test';
+import { auth, passwordAuthEnabled } from '../../../src/lib/auth/server.ts';
+
+describe('password authentication', () => {
+  it('stays off unless TACK_PASSWORD_AUTH is set', () => {
+    expect(process.env['TACK_PASSWORD_AUTH']).toBeUndefined();
+    expect(passwordAuthEnabled).toBe(false);
+    expect(auth.options.emailAndPassword?.enabled).toBe(false);
+  });
+
+  it('keeps the passwordless methods available', () => {
+    expect(auth.options.plugins?.map((plugin) => plugin.id)).toEqual(
+      expect.arrayContaining(['passkey', 'email-otp', 'organization']),
+    );
+  });
+
+  it('stores sign in codes as hashes', () => {
+    const plugin = auth.options.plugins?.find((candidate) => candidate.id === 'email-otp');
+    if (!(plugin && 'options' in plugin)) throw new Error('Email OTP plugin is missing');
+    expect(plugin.options).toMatchObject({ storeOTP: 'hashed' });
+  });
+
+  it('exposes the MCP OAuth provider for one-click clients', () => {
+    expect(auth.options.plugins?.map((plugin) => plugin.id)).toEqual(
+      expect.arrayContaining(['mcp']),
+    );
+  });
+
+  it('lets an authenticated user link a provider whose email differs', () => {
+    expect(auth.options.account?.accountLinking?.enabled).toBe(true);
+    expect(auth.options.account?.accountLinking?.allowDifferentEmails).toBe(true);
+  });
+
+  it('hashes with argon2id and verifies the hash', async () => {
+    const hash = await Bun.password.hash('a-very-long-password', { algorithm: 'argon2id' });
+    expect(hash.startsWith('$argon2id$')).toBe(true);
+    expect(await Bun.password.verify('a-very-long-password', hash)).toBe(true);
+    expect(await Bun.password.verify('wrong', hash)).toBe(false);
+  });
+});
+
+describe('open signup rate limits', () => {
+  const rules = auth.options.rateLimit?.customRules ?? {};
+
+  function registeredPaths(): Set<string> {
+    const paths = new Set<string>();
+    for (const endpoint of Object.values(auth.api)) {
+      const path = (endpoint as { path?: unknown }).path;
+      if (typeof path === 'string') paths.add(path);
+    }
+    return paths;
+  }
+
+  it('caps sign in codes even though password auth is off', () => {
+    expect(passwordAuthEnabled).toBe(false);
+    expect(rules['/email-otp/send-verification-otp']).toEqual({ window: 600, max: 10 });
+  });
+
+  it('keeps the password rules for deployments that enable them', () => {
+    expect(rules['/sign-in/email']).toEqual({ window: 60, max: 5 });
+    expect(rules['/sign-up/email']).toEqual({ window: 3600, max: 5 });
+  });
+
+  it('names paths that better-auth actually serves, so no rule is dead', () => {
+    const served = registeredPaths();
+    expect(served.size).toBeGreaterThan(0);
+    for (const path of Object.keys(rules)) expect(served).toContain(path);
+  });
+
+  it('matches rules against the path better-auth strips the base from', async () => {
+    const context = await auth.$context;
+    expect(new URL(context.baseURL).pathname).toBe('/api/auth');
+  });
+});
+
+describe('email domain allowlist', () => {
+  const previous = process.env['ALLOWED_EMAIL_DOMAINS'];
+
+  afterEach(() => {
+    process.env['ALLOWED_EMAIL_DOMAINS'] = previous ?? '';
+  });
+
+  function createUserHook() {
+    const before = auth.options.databaseHooks?.user?.create?.before;
+    if (before === undefined) throw new Error('the user create hook is missing');
+    return (email: string) =>
+      before({
+        id: 'user_1',
+        name: 'Sam',
+        email,
+        emailVerified: true,
+        image: null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      });
+  }
+
+  it('rejects an address outside the allowlist whichever provider created it', async () => {
+    process.env['ALLOWED_EMAIL_DOMAINS'] = 'test.example,YOUR_DOMAIN';
+    const hook = createUserHook();
+
+    let thrown: unknown;
+    try {
+      await hook('sam@test.example');
+    } catch (error) {
+      thrown = error;
+    }
+    expect(thrown).toMatchObject({ status: 'FORBIDDEN' });
+
+    const allowed = await hook('alex@test.example');
+    expect(allowed.data.email).toBe('alex@test.example');
+  });
+
+  it('allows every address when nothing is configured', async () => {
+    process.env['ALLOWED_EMAIL_DOMAINS'] = '';
+    const allowed = await createUserHook()('sam@test.example');
+    expect(allowed.data.handle).toBeDefined();
+  });
+});
