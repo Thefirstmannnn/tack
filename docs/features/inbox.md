@@ -3,12 +3,6 @@
 The grouped inbox gives each subject a conversation with an ordered event history.
 It does not create another list entry for every review comment or failed job.
 
-![A pull request with three updates in one inbox conversation](../assets/screenshots/notification-pull-request-conversation-dark.png)
-
-![A document comment conversation in the light theme](../assets/screenshots/notification-document-conversation-light.png)
-
-These screenshots use a local demo workspace, not production member data.
-
 ## What people receive
 
 | Activity | Inbox grouping | Personal delivery |
@@ -63,12 +57,6 @@ Comment previews use readable plain text, at most two nonempty lines and about
 available through the links. Untrusted comment text does not automatically
 trigger Slack channel or user mentions. Roots no longer repeat a thread-guidance
 footer, and replies never broadcast back to the channel.
-
-![A local preview of the Slack root, reply and document message](../assets/screenshots/notification-slack-formatter-preview.png)
-
-This earlier preview renders formatter blocks with sample data, not production
-messages. The current layout uses shorter previews and omits the guidance
-footer shown above. The Slack client's final layout can differ.
 
 Notification email uses Resend and a verified address. Neither Slack nor email
 is recorded as delivered until the provider confirms a message identity.
