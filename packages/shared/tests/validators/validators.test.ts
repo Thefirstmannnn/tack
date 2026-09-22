@@ -1,0 +1,247 @@
+import { describe, expect, it } from 'bun:test';
+import {
+  ISSUE_DESCRIPTION_MAX_LENGTH,
+  ISSUE_REVIEWER_MAX_COUNT,
+} from '../../src/constants/index.ts';
+import {
+  bootstrapQuerySchema,
+  cycleCreateSchema,
+  cycleUpdateSchema,
+  docFilterSchema,
+  docUpdateSchema,
+  issueCreateSchema,
+  issueFilterSchema,
+  issueSummaryQuerySchema,
+  issueUpdateSchema,
+  labelUpdateSchema,
+  milestoneUpdateSchema,
+  organizationUpdateSchema,
+  projectUpdateSchema,
+  teamUpdateSchema,
+  viewUpdateSchema,
+  workflowStateUpdateSchema,
+} from '../../src/validators/index.ts';
+
+const updateSchemas = {
+  issue: issueUpdateSchema,
+  label: labelUpdateSchema,
+  project: projectUpdateSchema,
+  milestone: milestoneUpdateSchema,
+  cycle: cycleUpdateSchema,
+  doc: docUpdateSchema,
+  view: viewUpdateSchema,
+  team: teamUpdateSchema,
+  workflowState: workflowStateUpdateSchema,
+  organization: organizationUpdateSchema,
+} as const;
+
+describe('update schemas never invent values', () => {
+  it('returns an empty object for an empty patch', () => {
+    for (const [name, schema] of Object.entries(updateSchemas)) {
+      expect({ name, value: schema.parse({}) }).toEqual({ name, value: {} });
+    }
+  });
+
+  it('returns only the keys the caller supplied', () => {
+    expect(issueUpdateSchema.parse({ stateId: 'state_1' })).toEqual({ stateId: 'state_1' });
+    expect(labelUpdateSchema.parse({ name: 'Bug' })).toEqual({ name: 'Bug' });
+    expect(projectUpdateSchema.parse({ name: 'Alpha' })).toEqual({ name: 'Alpha' });
+    expect(docUpdateSchema.parse({ title: 'Runbook' })).toEqual({ title: 'Runbook' });
+  });
+
+  it('still accepts an explicit null so a field can be cleared', () => {
+    expect(issueUpdateSchema.parse({ assigneeId: null })).toEqual({ assigneeId: null });
+  });
+
+  it('still validates the fields it is given', () => {
+    expect(issueUpdateSchema.safeParse({ priority: 9 }).success).toBe(false);
+    expect(issueUpdateSchema.safeParse({ title: '' }).success).toBe(false);
+    expect(labelUpdateSchema.safeParse({ color: 'red' }).success).toBe(false);
+  });
+});
+
+describe('issue descriptions', () => {
+  it('accepts pasted file contents while keeping a bounded request size', () => {
+    expect(issueUpdateSchema.safeParse({ description: 'x'.repeat(150_000) }).success).toBe(true);
+    expect(
+      issueUpdateSchema.safeParse({
+        description: 'x'.repeat(ISSUE_DESCRIPTION_MAX_LENGTH),
+      }).success,
+    ).toBe(true);
+    expect(
+      issueUpdateSchema.safeParse({
+        description: 'x'.repeat(ISSUE_DESCRIPTION_MAX_LENGTH + 1),
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('create schemas still apply their defaults', () => {
+  it('fills defaults the caller omitted', () => {
+    const parsed = issueCreateSchema.parse({ teamId: 'team_1', title: 'Ship it' });
+    expect(parsed.priority).toBe(0);
+    expect(parsed.description).toBe('');
+    expect(parsed.labelIds).toEqual([]);
+    expect(parsed.reviewerIds).toEqual([]);
+  });
+
+  it('leaves an omitted assignee undefined so the service can tell it from a deliberate none', () => {
+    const omitted = issueCreateSchema.parse({ teamId: 'team_1', title: 'Ship it' });
+    const cleared = issueCreateSchema.parse({
+      teamId: 'team_1',
+      title: 'Ship it',
+      assigneeId: null,
+    });
+
+    expect(omitted.assigneeId).toBeUndefined();
+    expect(cleared.assigneeId).toBeNull();
+  });
+
+  it('accepts multiple reviewers and caps the field at fifty people', () => {
+    expect(issueUpdateSchema.parse({ reviewerIds: ['user_1', 'user_2'] })).toEqual({
+      reviewerIds: ['user_1', 'user_2'],
+    });
+    expect(
+      issueUpdateSchema.safeParse({
+        reviewerIds: Array.from(
+          { length: ISSUE_REVIEWER_MAX_COUNT + 1 },
+          (_value, index) => `user_${index}`,
+        ),
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('validator hardening from review', () => {
+  it('rejects a null or blank cycle date instead of coercing it to the epoch', () => {
+    expect(
+      cycleCreateSchema.safeParse({ teamId: 'team_1', startsAt: null, endsAt: '2026-01-02' })
+        .success,
+    ).toBe(false);
+    expect(
+      cycleCreateSchema.safeParse({ teamId: 'team_1', startsAt: '   ', endsAt: '2026-01-02' })
+        .success,
+    ).toBe(false);
+  });
+
+  it('accepts IANA cycle timezones and rejects unknown timezone names', () => {
+    expect(
+      cycleCreateSchema.safeParse({ teamId: 'team_1', timezone: 'America/New_York' }).success,
+    ).toBe(true);
+    expect(cycleUpdateSchema.safeParse({ timezone: 'Asia/Kolkata' }).success).toBe(true);
+    expect(
+      cycleCreateSchema.safeParse({ teamId: 'team_1', timezone: 'Mars/Olympus' }).success,
+    ).toBe(false);
+    expect(cycleUpdateSchema.safeParse({ timezone: 'UTC+05:30' }).success).toBe(false);
+  });
+
+  it('treats includeArchived=false as false', () => {
+    expect(docFilterSchema.parse({ includeArchived: 'false' }).includeArchived).toBe(false);
+    expect(docFilterSchema.parse({ includeArchived: 'true' }).includeArchived).toBe(true);
+    expect(docFilterSchema.parse({}).includeArchived).toBe(false);
+  });
+
+  it('rejects a malformed boolean query value rather than reading it as false', () => {
+    expect(issueFilterSchema.safeParse({ includeArchived: 'unexpected' }).success).toBe(false);
+    expect(issueFilterSchema.parse({ includeArchived: '0' }).includeArchived).toBe(false);
+  });
+
+  it('shares participant summary grouping and its state fallback', () => {
+    expect(issueSummaryQuerySchema.parse({ groupBy: 'participant' }).groupBy).toBe('participant');
+    expect(issueSummaryQuerySchema.parse({ groupBy: 'milestone' }).groupBy).toBe('milestone');
+    expect(issueSummaryQuerySchema.parse({ groupBy: 'none' }).groupBy).toBe('state');
+    expect(issueSummaryQuerySchema.safeParse({ groupBy: 'unknown' }).success).toBe(false);
+  });
+
+  it('rejects a blank team selector and a blank allowed email domain', () => {
+    expect(bootstrapQuerySchema.safeParse({ team: '   ' }).success).toBe(false);
+    expect(organizationUpdateSchema.safeParse({ allowedEmailDomains: ['   '] }).success).toBe(
+      false,
+    );
+  });
+});
+
+describe('workspace agent instructions', () => {
+  it('accepts up to 4000 characters and rejects longer instructions', () => {
+    expect(
+      organizationUpdateSchema.safeParse({ agentInstructions: 'x'.repeat(4000) }).success,
+    ).toBe(true);
+    expect(
+      organizationUpdateSchema.safeParse({ agentInstructions: 'x'.repeat(4001) }).success,
+    ).toBe(false);
+  });
+
+  it('accepts an instruction baseline only alongside an instruction update', () => {
+    expect(
+      organizationUpdateSchema.safeParse({
+        agentInstructions: 'Use ENG for engineering issues.',
+        expectedAgentInstructions: 'Use the Platform team for bugs.',
+      }).success,
+    ).toBe(true);
+    expect(
+      organizationUpdateSchema.safeParse({
+        expectedAgentInstructions: 'Use the Platform team for bugs.',
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe('calendar dates', () => {
+  const dayOf = (value: unknown): string | null => {
+    const parsed = issueUpdateSchema.safeParse({ dueDate: value });
+    if (!parsed.success) return null;
+    const day = parsed.data.dueDate;
+    return day === null || day === undefined ? null : day.toISOString().slice(0, 10);
+  };
+
+  it('reads a calendar day as that day in UTC, whatever the host timezone is', () => {
+    expect(dayOf('2031-03-04')).toBe('2031-03-04');
+    expect(dayOf('0001-01-01')).toBe('0001-01-01');
+    expect(dayOf('9999-12-31')).toBe('9999-12-31');
+  });
+
+  it('refuses a year a date column cannot hold, rather than truncating it', () => {
+    for (const extreme of ['+275760-09-13', '-000001-01-01', '0000-12-31', '10000-01-01']) {
+      expect({ sent: extreme, day: dayOf(extreme) }).toEqual({ sent: extreme, day: null });
+    }
+  });
+
+  it('fails the parse on such a year instead of quietly storing no date', () => {
+    for (const extreme of ['+275760-09-13', '-000001-01-01', '0000-12-31', '10000-01-01']) {
+      const parsed = issueUpdateSchema.safeParse({ dueDate: extreme });
+
+      expect({ sent: extreme, accepted: parsed.success }).toEqual({
+        sent: extreme,
+        accepted: false,
+      });
+    }
+  });
+
+  it('refuses anything that is not a calendar day', () => {
+    for (const nonsense of [
+      true,
+      false,
+      0,
+      1_700_000_000_000,
+      'banana',
+      '2026-02-30',
+      '2026-2-3',
+      '',
+      {},
+      [],
+    ]) {
+      expect(issueUpdateSchema.safeParse({ dueDate: nonsense }).success).toBe(false);
+    }
+  });
+
+  it('keeps null, which is how a due date is cleared', () => {
+    expect(issueUpdateSchema.parse({ dueDate: null }).dueDate).toBeNull();
+  });
+
+  it('holds project and milestone dates to the same shape', () => {
+    expect(projectUpdateSchema.safeParse({ targetDate: '+275760-09-13' }).success).toBe(false);
+    expect(projectUpdateSchema.safeParse({ startDate: true }).success).toBe(false);
+    expect(milestoneUpdateSchema.safeParse({ targetDate: '10000-01-01' }).success).toBe(false);
+    expect(milestoneUpdateSchema.safeParse({ targetDate: '2031-03-01' }).success).toBe(true);
+  });
+});

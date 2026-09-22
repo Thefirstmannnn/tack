@@ -1,0 +1,318 @@
+# Configuration
+
+Every setting is an environment variable. `.env.example` is a working local
+configuration, so copy it and change what you need:
+
+```bash
+cp .env.example .env
+```
+
+> **Self-hosting status: Preview.** The production values on this page are a
+> configuration reference, not a supported production release or provider
+> compatibility guarantee. See [Open-source readiness](open-source-readiness.md).
+
+Tack parses its own environment with Zod at startup, so a missing or malformed
+required variable fails immediately with a message that names it, rather than
+failing later somewhere confusing.
+
+Bun does not implement `process.loadEnvFile`, so scripts load the repository
+`.env` with `bun --env-file=../../.env` in the script itself. A script whose
+working directory is inside a workspace package will not see the repository
+`.env` without that flag.
+
+## Required
+
+| Variable | Example | Notes |
+| --- | --- | --- |
+| `DATABASE_URL` | `postgres://tack:tack@localhost:5434/tack` | Postgres 16 or newer. In production use the runtime connection string recommended by your provider |
+| `REDIS_URL` | `redis://localhost:6380` | Redis 7 or newer. Carries realtime fan-out. Use `rediss://` for TLS |
+| `BETTER_AUTH_SECRET` | 32+ random characters | Signs sessions. `openssl rand -base64 32`. Never reuse the example value |
+| `BETTER_AUTH_URL` | `https://tack.example.com` | Must match the origin exactly, or sign-in loops |
+| `NEXT_PUBLIC_APP_URL` | `https://tack.example.com` | Public origin. Used for absolute links in email and OAuth metadata |
+
+## Database
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `DATABASE_PREPARED_STATEMENTS` | `false` | Set to `true` only when the database endpoint supports protocol-level named prepared statements |
+
+Tack disables automatic named prepared statements by default because transaction
+poolers do not expose that capability consistently. Direct connections and session
+poolers support them. Some transaction poolers support them when configured to track
+named statements, while others require them to stay off.
+
+Do not add a `prepare` query option to `DATABASE_URL`. Tack refuses that ambiguous
+configuration and uses `DATABASE_PREPARED_STATEMENTS` as the single source of truth.
+Connection options such as `sslmode=require` remain in `DATABASE_URL`.
+
+## Scheduled maintenance
+
+| Variable | Notes |
+| --- | --- |
+| `CRON_SECRET` | Protects the scheduled sprint rollover, sprint snapshot, operational pruning, and notification worker routes. Use a long random value in every deployed environment |
+| `NOTIFICATION_PROVIDERS_PAUSED` | Set `true` to stop Slack and notification-email claims during migration or incident response. Defaults to false |
+| `NOTIFICATION_CONVERSATIONS_ENABLED` | Set `true` after conversation backfill and verification to select the grouped inbox. False or unset retains the legacy view |
+
+Vercel presents `CRON_SECRET` as a bearer token when it invokes the scheduled
+routes. Without the secret, protected routes refuse to run. The notification
+worker runs every minute. Slack delivery additionally requires
+`SLACK_ENABLED=true`; notification email requires Resend configuration.
+Pausing providers preserves queued work and still allows GitHub reconciliation
+and snooze wakes. See [Inbox conversations](features/inbox.md) for rollout order.
+The sprint rollover route runs every minute. It closes expired sprints and moves
+unfinished committed tasks into the next scheduled sprint, creating a successor
+with the same duration if needed. Completed and canceled tasks retain their sprint;
+triage and backlog tasks return to the backlog, matching manual completion.
+Missed boundaries are processed oldest first, up to 100 completions per invocation.
+Repeated or overlapping invocations do not close a sprint twice. Task assignment
+menus and filters show current and future sprints, with the active one labeled
+Current sprint. The Current sprint filter stores a relative selection, so saved
+views follow the active sprint when the calendar advances. Open pages refresh
+sprint choices, facet counts, and relative sprint results within a minute, and
+refresh stale workspace data when the window regains focus. Sprint history
+remains available from the Sprints page.
+
+New workspaces and newly created sprints default to seven days. Explicit dates
+remain supported, and existing sprint dates are not rewritten. A workspace that
+already has two-week sprints keeps that schedule until its dates are edited.
+To change an existing schedule, edit the sprint dates from the Sprints page and
+use **Move later sprints by the same amount** when later windows must move too.
+The rollover job uses stored dates, not the sprint number or a calendar-week
+number.
+
+If a menu shows Current sprint (Sprint 1) but omits Sprint 2, inspect the stored
+windows and completion state on the Sprints page or the authenticated
+`/api/cycles` response. Current means `startsAt <= now < endsAt` and not completed;
+expired or completed sprints are excluded from assignment menus, and archived
+records are excluded from workspace data. A missing number alone does not prove
+that rollover failed. Check the Vercel cron invocation logs for
+`/api/cron/sprint-rollover` to verify execution. An unauthenticated 401 confirms
+route protection, not a successful scheduled run. Correct the dates or completion
+state only after establishing why that specific sprint was excluded.
+The analytics route runs every six hours so every sprint-local
+calendar day is observed across timezone and daylight-saving changes. It records
+one row per active sprint and local day, then publishes the returned realtime
+actions. Sprint completion also records a final snapshot in the same transaction
+before unfinished work rolls into the next sprint. New and updated sprint timezones
+must be valid IANA names. A legacy sprint with an invalid stored timezone uses UTC
+explicitly so it cannot block other snapshots or prevent the sprint from closing.
+
+## Realtime
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `NEXT_PUBLIC_REALTIME_URL` | unset | **Local development only.** Set it to `ws://localhost:3100` locally; the app connects to `/api/ws` under it |
+| `REALTIME_PORT` | `3100` | Port for `apps/realtime`, which is never deployed |
+
+`NEXT_PUBLIC_REALTIME_URL` is ignored whenever `NODE_ENV` is `production`, where
+the socket is always served from the page's own origin at `/api/ws`. Setting it
+on a deployed environment does nothing useful and risks confusing whoever reads
+the config next, so leave it unset there.
+
+## Authentication
+
+Tack uses [better-auth](https://better-auth.com). A production build and server
+start require at least one usable first-login method: password authentication,
+a complete Google or GitHub credential pair, or email OTP delivery through
+Resend with an explicit non-local sender. Passkeys work after a user registers
+one, but cannot bootstrap a new installation. Local development is unaffected.
+
+| Variable | Notes |
+| --- | --- |
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google sign-in. Redirect URI is `<app>/api/auth/callback/google` |
+| `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | GitHub sign-in. Callback is `<app>/api/auth/callback/github` |
+| `TACK_PASSWORD_AUTH` | `false` by default. `true` enables email and password |
+| `ALLOWED_EMAIL_DOMAINS` | Unset by default, which means anyone can sign up. Comma separated to restrict |
+| `TACK_DEV_LOGIN` | **Local only.** One-click sign-in as any seeded user |
+
+Email and password is off by default and hashed with `@node-rs/argon2`
+(argon2id) when on. It is rate limited, and it is never a replacement for the
+passwordless methods. Leave it off unless you have a reason.
+
+Signing up is open unless you close it. A new account creates its own workspace
+through the onboarding flow, and a workspace admits nobody else until it invites
+them, so an open instance is still one tenant per workspace.
+
+`ALLOWED_EMAIL_DOMAINS` closes that door. It is enforced on invite creation, on
+user creation and when a sign-in code is requested, so it covers every provider
+rather than just invites, and it is checked again on every session so an address
+that stops qualifying loses access. A refused address is told so, rather than
+being left waiting for a code that will never arrive.
+
+Set it when an instance should only admit one organisation. A value that is set
+but names no domain, such as a bare `@`, is refused rather than read as no
+restriction, so a typo cannot quietly open an instance you meant to close.
+
+A workspace can narrow it further with its own `allowedEmailDomains` setting. The
+hosted instance at <https://YOUR_DOMAIN> leaves it unset.
+
+Authentication is rate limited per IP whatever the method: 10 sign-in code requests
+each ten minutes, 5 password sign-ins a minute, and 5 password sign-ups an hour,
+on top of better-auth's own defaults for the paths without a rule of their own.
+Better-auth applies them in production only, and a sign-in code additionally dies
+after three wrong guesses.
+
+A custom rule replaces better-auth's matching default rather than stacking with
+it, which is why the sign-in code window is ten minutes and not an hour. An
+hourly rule would have to allow a whole hour of sends in a single burst, and a
+per-IP hourly cap tight enough to be worth having would lock out an office that
+shares one address.
+
+In production those counters live in Redis, on the `REDIS_URL` the app already
+needs, so the caps hold across every serverless instance rather than resetting
+with each one. If Redis cannot be reached the check lets the request through
+rather than locking everybody out, which means an outage costs you the ceiling
+and not sign-in. Outside production better-auth keeps its own in-process store,
+which is all a single development server needs.
+
+```bash
+ALLOWED_EMAIL_DOMAINS=example.com,example.org
+```
+
+**`TACK_DEV_LOGIN` must never be set on a deployed environment.** It lists the
+seeded users on the login screen and signs anyone in as any of them.
+
+`TACK_DEV_LOGIN` and passkeys do not satisfy the production first-login check.
+Half-configured OAuth providers, blank values and the local
+`Tack <auth@tack.local>` sender are also rejected.
+
+This check proves only that a complete method is present. It cannot contact an
+OAuth provider or confirm that Resend has verified the sender domain, so test a
+real production sign-in after deployment.
+
+## Email
+
+Tack sends through [Resend](https://resend.com) only, for sign-in codes and
+invites. Event notification email and digests are not currently dispatched.
+
+| Variable | Notes |
+| --- | --- |
+| `RESEND_API_KEY` | From the Resend dashboard |
+| `EMAIL_FROM` | Must be on a domain verified in Resend |
+
+```bash
+RESEND_API_KEY=re_xxxxxxxxx
+EMAIL_FROM="Tack <tack@example.com>"
+```
+
+If `EMAIL_FROM` is not on a verified domain every send fails, and users see
+missing sign-in codes and invitations.
+
+The sender in `.env.example` is local-only. Replace it before relying on Resend
+for production authentication.
+
+## Object storage
+
+Any S3-compatible bucket. Uploads go straight from the browser through a
+presigned PUT.
+
+| Variable | Local value | Notes |
+| --- | --- | --- |
+| `S3_ENDPOINT` | `http://localhost:9010` | MinIO locally, R2 or S3 in production |
+| `S3_REGION` | `us-east-1` | `auto` for Cloudflare R2 |
+| `S3_BUCKET` | `tack-uploads` | |
+| `S3_ACCESS_KEY_ID` | `tackminio` | |
+| `S3_SECRET_ACCESS_KEY` | `tackminio` | |
+
+The bucket needs a CORS policy allowing your origin, otherwise uploads fail in
+the browser while the server logs look healthy. `infra/s3-cors.json` is the
+document, with the origin as a placeholder.
+
+Workspace deletion needs permission to list and delete both current objects and
+object versions. On AWS S3, grant `s3:ListBucket`, `s3:ListBucketVersions`,
+`s3:DeleteObject`, and `s3:DeleteObjectVersion` for the upload bucket.
+
+## Integrations
+
+| Variable | Notes |
+| --- | --- |
+| `GITHUB_APP_ID` | GitHub App, for linking pull requests to issues |
+| `GITHUB_APP_PRIVATE_KEY` | The PEM. Escaped newlines as `\n` are handled |
+| `GITHUB_APP_SLUG` | The app's URL slug. Without it, the connect button hides |
+| `GITHUB_APP_CLIENT_ID`, `GITHUB_APP_CLIENT_SECRET` | Exchange the callback code to confirm the installation belongs to the person connecting. Without them the connect flow refuses rather than binding an installation it cannot attribute |
+| `GITHUB_WEBHOOK_SECRET` | Verifies inbound webhooks |
+| `SLACK_CLIENT_ID` | Slack OAuth client ID. It is not secret |
+| `SLACK_APP_ID` | Optional fallback app identity for legacy connections. New OAuth connections store the returned app ID automatically |
+| `SLACK_CLIENT_SECRET` | Slack OAuth client secret. Mark it Sensitive in Vercel |
+| `SLACK_SIGNING_SECRET` | Verifies Slack webhook signatures. Mark it Sensitive in Vercel |
+| `SLACK_ENABLED` | Global server-side Slack gate. `true` enables Slack for every current and future Tack organization. False or unset keeps Slack dark |
+
+All are optional. Tack hides the GitHub affordance when it is not configured.
+Slack requires all three Slack OAuth and webhook variables. Keep
+`SLACK_ENABLED=false` or leave it unset while preparing a deployment. Setting
+it to `true` is a global release action: the Slack settings surface, routes,
+webhook processing, and notification worker become available to every current
+and future Tack organization. It does not connect an organization
+automatically. An authorized manager must complete a separate OAuth connection
+for each organization.
+
+Do not configure `SLACK_BOT_TOKEN` or `SLACK_APP_TOKEN`.
+Tack does not use those global tokens. Prefer reconnecting legacy installations
+through OAuth to persist their app identity. See [Integrations](integrations.md#slack) for the safe
+launch sequence and Slack-side configuration.
+
+## MCP
+
+| Variable | Notes |
+| --- | --- |
+| `NEXT_PUBLIC_MCP_URL` | Overrides the advertised MCP URL. Defaults to `<app>/mcp` |
+
+You almost never need this. It exists for deployments that put the MCP endpoint
+behind a different hostname. See [MCP server](mcp.md).
+
+## Testing
+
+| Variable | Notes |
+| --- | --- |
+| `TACK_TEST_LANE` | Isolates a test run into its own set of databases |
+| `TACK_E2E_BASE_URL` | Where Playwright points. Defaults to `NEXT_PUBLIC_APP_URL` |
+
+`TACK_TEST_LANE` matters whenever two runs share a Postgres, which happens with
+two worktrees or two agents. Without it both runs truncate the same tables and
+you get deadlocks and foreign key violations that look like real failures.
+
+```bash
+TACK_TEST_LANE=my-branch bun run test
+TACK_TEST_LANE=my-branch bun run db:test-lanes-drop
+```
+
+The lane name becomes a readable stub plus a digest of the raw value, so two
+lanes that normalise alike stay apart.
+
+The cleanup drops only the lane named by `TACK_TEST_LANE`, and refuses when
+that is unset. `bun run db:test-lanes-drop --all` drops every lane on the
+server, including lanes another worktree is using. Neither mode touches the six
+base databases.
+
+## Reference: a deployment environment
+
+```bash
+DATABASE_URL=postgres://user:pass@runtime-db.example.com:5432/tack?sslmode=require
+DATABASE_PREPARED_STATEMENTS=false
+REDIS_URL=rediss://default:pass@redis.example.com:6379
+CRON_SECRET=<openssl rand -base64 32>
+
+BETTER_AUTH_SECRET=<openssl rand -base64 32>
+BETTER_AUTH_URL=https://tack.example.com
+NEXT_PUBLIC_APP_URL=https://tack.example.com
+
+GOOGLE_CLIENT_ID=...
+GOOGLE_CLIENT_SECRET=...
+
+ALLOWED_EMAIL_DOMAINS=example.com
+
+RESEND_API_KEY=re_...
+EMAIL_FROM="Tack <tack@example.com>"
+
+S3_ENDPOINT=https://<account>.r2.cloudflarestorage.com
+S3_REGION=auto
+S3_BUCKET=tack-uploads
+S3_ACCESS_KEY_ID=...
+S3_SECRET_ACCESS_KEY=...
+```
+
+Note what is absent: no `NEXT_PUBLIC_REALTIME_URL`, and no `TACK_DEV_LOGIN`.
+
+`ALLOWED_EMAIL_DOMAINS` appears here because this example is a single-company
+deployment. Drop the line to let anyone sign up, which is what the hosted
+instance does.

@@ -1,0 +1,281 @@
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import {
+  listInboxConversationEvents,
+  listInboxConversations,
+  markInboxConversationsRead,
+} from '@tack/core';
+import { and, db, eq, inArray, schema } from '@tack/db';
+import {
+  listInbox,
+  markRead,
+  notificationConversationActions,
+  notificationSubjectAccessMap,
+} from '@tack/services/notifications';
+import { NOTIFICATION_TYPES } from '@tack/shared/constants';
+import type { Principal } from '@tack/shared/policy';
+import {
+  idSchema,
+  inboxConversationQuerySchema,
+  inboxConversationReadSchema,
+  inboxHistoryQuerySchema,
+} from '@tack/shared/validators';
+import { z } from 'zod';
+import { defineTool, publish } from './support.ts';
+
+interface IssueSummary {
+  readonly identifier: string;
+  readonly title: string;
+  readonly teamKey: string;
+}
+
+interface DocSummary {
+  readonly id: string;
+  readonly title: string;
+}
+
+async function docIdsForComments(
+  organizationId: string,
+  commentIds: readonly string[],
+): Promise<Map<string, string>> {
+  if (commentIds.length === 0) return new Map();
+  const rows = await db
+    .select({ id: schema.docComment.id, docId: schema.docComment.docId })
+    .from(schema.docComment)
+    .where(
+      and(
+        eq(schema.docComment.organizationId, organizationId),
+        inArray(schema.docComment.id, [...commentIds]),
+      ),
+    );
+  return new Map(rows.map((row) => [row.id, row.docId]));
+}
+
+async function docSummaries(
+  principal: Principal,
+  docIds: readonly string[],
+): Promise<Map<string, DocSummary>> {
+  if (docIds.length === 0) return new Map();
+  return await db.transaction(async (tx) => {
+    const allowed = await notificationSubjectAccessMap(
+      tx,
+      principal.organizationId,
+      principal.userId,
+      docIds.map((id) => ({ id, subjectType: 'doc', subjectId: id })),
+    );
+    const ids = docIds.filter((id) => allowed.get(id) === true);
+    if (ids.length === 0) return new Map();
+    const rows = await tx
+      .select({ id: schema.doc.id, title: schema.doc.title })
+      .from(schema.doc)
+      .where(
+        and(eq(schema.doc.organizationId, principal.organizationId), inArray(schema.doc.id, ids)),
+      );
+    return new Map(rows.map((row) => [row.id, { id: row.id, title: row.title }]));
+  });
+}
+
+async function issueIdsForComments(
+  organizationId: string,
+  commentIds: readonly string[],
+): Promise<Map<string, string>> {
+  if (commentIds.length === 0) return new Map();
+  const rows = await db
+    .select({ id: schema.comment.id, issueId: schema.comment.issueId })
+    .from(schema.comment)
+    .where(
+      and(
+        eq(schema.comment.organizationId, organizationId),
+        inArray(schema.comment.id, [...commentIds]),
+      ),
+    );
+  return new Map(rows.map((row) => [row.id, row.issueId]));
+}
+
+async function issueSummaries(
+  principal: Principal,
+  issueIds: readonly string[],
+): Promise<Map<string, IssueSummary>> {
+  if (issueIds.length === 0) return new Map();
+  return await db.transaction(async (tx) => {
+    const allowed = await notificationSubjectAccessMap(
+      tx,
+      principal.organizationId,
+      principal.userId,
+      issueIds.map((id) => ({ id, subjectType: 'issue', subjectId: id })),
+    );
+    const ids = issueIds.filter((id) => allowed.get(id) === true);
+    if (ids.length === 0) return new Map();
+    const rows = await tx
+      .select({
+        id: schema.issue.id,
+        identifier: schema.issue.identifier,
+        title: schema.issue.title,
+        teamKey: schema.team.key,
+      })
+      .from(schema.issue)
+      .innerJoin(schema.team, eq(schema.team.id, schema.issue.teamId))
+      .where(
+        and(
+          eq(schema.issue.organizationId, principal.organizationId),
+          inArray(schema.issue.id, ids),
+        ),
+      );
+    return new Map(
+      rows.map((row) => [
+        row.id,
+        { identifier: row.identifier, title: row.title, teamKey: row.teamKey },
+      ]),
+    );
+  });
+}
+
+export function registerInboxTools(server: McpServer, principal: Principal): void {
+  defineTool(
+    server,
+    {
+      name: 'list_inbox_conversations',
+      title: 'List inbox conversations',
+      readOnly: true,
+      description:
+        'Your inbox grouped into one conversation per pull request, document, or issue activity family. Filters run before pagination. Cursors describe a live feed: fetch a fresh first page to reconcile conversations moved by new activity. Counts are unread conversations, not events.',
+      inputSchema: inboxConversationQuerySchema.shape,
+    },
+    async (input) => ({ ...(await listInboxConversations(principal, input)) }),
+  );
+  defineTool(
+    server,
+    {
+      name: 'list_inbox_conversation_events',
+      title: 'Read conversation history',
+      readOnly: true,
+      description:
+        'Read immutable notification events newest first for one of your currently accessible conversations. Use the returned cursor for older updates.',
+      inputSchema: { conversationId: idSchema, ...inboxHistoryQuerySchema.shape },
+    },
+    async ({ conversationId, ...input }) => ({
+      ...(await listInboxConversationEvents(principal, conversationId, input)),
+    }),
+  );
+  defineTool(
+    server,
+    {
+      name: 'mark_inbox_conversations_read',
+      title: 'Mark conversations read or unread',
+      readOnly: false,
+      description:
+        'Mark your own conversations read or manually unread. This updates every active event compatibly and returns authoritative conversation counters. Do not mark work read until acted on or handed on.',
+      inputSchema: inboxConversationReadSchema.shape,
+    },
+    async (input) => {
+      const { actions, ...result } = await markInboxConversationsRead(principal, input);
+      await publish(actions);
+      return result;
+    },
+  );
+  defineTool(
+    server,
+    {
+      name: 'list_notifications',
+      title: 'List your notifications',
+      description:
+        'Your inbox: mentions, assignments, replies and state changes addressed to you. This is how you find work someone has handed you by name. Tack never notifies you about your own actions, so nothing here was written by you.',
+      readOnly: true,
+      inputSchema: {
+        unreadOnly: z
+          .boolean()
+          .optional()
+          .describe('Only unread notifications. Defaults to false.'),
+        type: z.enum(NOTIFICATION_TYPES).optional().describe('Only this notification type.'),
+        limit: z.number().int().min(1).max(100).optional().describe('Notifications per page.'),
+        cursor: z.string().min(1).optional().describe('Cursor returned by a previous call.'),
+      },
+    },
+    async (args) => {
+      const page = await listInbox(db, {
+        userId: principal.userId,
+        organizationId: principal.organizationId,
+        ...(args.unreadOnly === undefined ? {} : { unreadOnly: args.unreadOnly }),
+        ...(args.type === undefined ? {} : { type: args.type }),
+        ...(args.limit === undefined ? {} : { limit: args.limit }),
+        ...(args.cursor === undefined ? {} : { cursor: args.cursor }),
+      });
+
+      const commentIds = page.items
+        .filter((item) => item.entityType === 'comment')
+        .map((item) => item.entityId);
+      const byComment = await issueIdsForComments(principal.organizationId, commentIds);
+
+      const docCommentIds = page.items
+        .filter((item) => item.entityType === 'doc_comment')
+        .map((item) => item.entityId);
+      const byDocComment = await docIdsForComments(principal.organizationId, docCommentIds);
+
+      const docIds = page.items.flatMap((item) => {
+        if (item.entityType === 'doc') return [item.entityId];
+        const resolved = byDocComment.get(item.entityId);
+        return resolved === undefined ? [] : [resolved];
+      });
+      const byDoc = await docSummaries(principal, docIds);
+
+      const issueIds = page.items.flatMap((item) => {
+        if (item.entityType === 'issue') return [item.entityId];
+        const resolved = byComment.get(item.entityId);
+        return resolved === undefined ? [] : [resolved];
+      });
+      const byIssue = await issueSummaries(principal, issueIds);
+
+      return {
+        notifications: page.items.map((item) => {
+          const issueId =
+            item.entityType === 'issue' ? item.entityId : byComment.get(item.entityId);
+          const docId = item.entityType === 'doc' ? item.entityId : byDocComment.get(item.entityId);
+          return {
+            id: item.id,
+            type: item.type,
+            reason: item.reason,
+            actorName: item.actorName,
+            title: item.title,
+            body: item.body,
+            url: item.url,
+            createdAt: item.createdAt.toISOString(),
+            read: item.readAt !== null,
+            issue: issueId === undefined ? null : (byIssue.get(issueId) ?? null),
+            doc: docId === undefined ? null : (byDoc.get(docId) ?? null),
+          };
+        }),
+        nextCursor: page.nextCursor,
+        unreadCount: page.unreadCount,
+      };
+    },
+  );
+
+  defineTool(
+    server,
+    {
+      name: 'mark_notification_read',
+      title: 'Mark notifications read',
+      description:
+        'Mark your own notifications read once you have acted on them, so they leave your unread queue. Mark a notification read only after the work it describes is done or handed on, never on first sight.',
+      readOnly: false,
+      inputSchema: {
+        ids: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(100)
+          .describe('Notification ids from list_notifications.'),
+      },
+    },
+    async (args) => {
+      const updated = await markRead(db, {
+        userId: principal.userId,
+        organizationId: principal.organizationId,
+        notificationIds: args.ids,
+        read: true,
+      });
+      await publish(
+        await notificationConversationActions(db, updated, { type: 'user', id: principal.userId }),
+      );
+      return { markedIds: updated.map((row) => row.id) };
+    },
+  );
+}

@@ -1,0 +1,418 @@
+import { and, asc, db, eq, inArray, isNull, schema, sql } from '@tack/db';
+import type { NotificationEvent } from '@tack/services/notifications';
+import { forbidden, notFound, validationFailed } from '@tack/shared/errors';
+import type { Actor, SyncAction } from '@tack/shared/events';
+import { scopes } from '@tack/shared/events';
+import type { Principal } from '@tack/shared/policy';
+import { assertCan, assertInTeam, teamScope } from '@tack/shared/policy';
+import { issueCommentUrl, truncate } from '@tack/shared/utils';
+import {
+  commentCreateSchema,
+  commentUpdateSchema,
+  paginationSchema,
+  reactionSchema,
+} from '@tack/shared/validators';
+import { principalActor } from '../activity/activity-service.ts';
+import { type Executor, newId, requireRow } from '../internal.ts';
+import { dedupeAudience, restrictAudience, teamReaderIds } from '../notifications/audience.ts';
+import { resolveMentions } from '../notifications/mentions.ts';
+import {
+  commentThreadAuthors,
+  issueSubscriberIds,
+  NOTIFICATION_BODY_LIMIT,
+  notifyRecipients,
+} from '../notifications/notify.ts';
+import { buildSyncAction } from '../realtime/publisher.ts';
+import { nextSyncId } from '../sync/sync-id.ts';
+
+export type CommentRow = typeof schema.comment.$inferSelect;
+export type ReactionRow = typeof schema.reaction.$inferSelect;
+
+export interface CommentWithReactions {
+  readonly comment: CommentRow;
+  readonly reactions: ReactionRow[];
+}
+
+async function loadIssueForComment(executor: Executor, principal: Principal, issueId: string) {
+  const [row] = await executor
+    .select({
+      id: schema.issue.id,
+      teamId: schema.issue.teamId,
+      projectId: schema.issue.projectId,
+      organizationId: schema.issue.organizationId,
+      identifier: schema.issue.identifier,
+    })
+    .from(schema.issue)
+    .where(
+      and(eq(schema.issue.id, issueId), eq(schema.issue.organizationId, principal.organizationId)),
+    )
+    .limit(1);
+  const issue = requireRow(row, 'That issue does not exist.');
+  assertInTeam(principal, teamScope(issue));
+  return issue;
+}
+
+function commentScopes(issue: { organizationId: string; teamId: string; id: string }): string[] {
+  return [scopes.team(issue.teamId), scopes.issue(issue.id)];
+}
+
+async function loadComment(
+  executor: Executor,
+  principal: Principal,
+  commentId: string,
+): Promise<CommentRow> {
+  const [row] = await executor
+    .select()
+    .from(schema.comment)
+    .where(
+      and(
+        eq(schema.comment.id, commentId),
+        eq(schema.comment.organizationId, principal.organizationId),
+      ),
+    )
+    .limit(1);
+  return requireRow(row, 'That comment does not exist.');
+}
+
+export interface CommentPage {
+  readonly comments: CommentWithReactions[];
+  readonly nextCursor: string | null;
+}
+
+export async function listComments(
+  principal: Principal,
+  issueId: string,
+  input: unknown = {},
+): Promise<CommentPage> {
+  assertCan(principal, 'issue:read');
+  await loadIssueForComment(db, principal, issueId);
+  const page = paginationSchema.parse(input);
+
+  const filters = [eq(schema.comment.issueId, issueId), isNull(schema.comment.deletedAt)];
+  if (page.cursor !== undefined) {
+    filters.push(
+      sql`(${schema.comment.createdAt}, ${schema.comment.id}) > (select ${schema.comment.createdAt}, ${schema.comment.id} from ${schema.comment} where ${schema.comment.id} = ${page.cursor})`,
+    );
+  }
+
+  const rows = await db
+    .select()
+    .from(schema.comment)
+    .where(and(...filters))
+    .orderBy(asc(schema.comment.createdAt), asc(schema.comment.id))
+    .limit(page.limit + 1);
+
+  const comments = rows.slice(0, page.limit);
+  const nextCursor = rows.length > page.limit ? (comments.at(-1)?.id ?? null) : null;
+  if (comments.length === 0) return { comments: [], nextCursor: null };
+
+  const reactions = await db
+    .select()
+    .from(schema.reaction)
+    .where(
+      inArray(
+        schema.reaction.commentId,
+        comments.map((row) => row.id),
+      ),
+    );
+
+  const byComment = new Map<string, ReactionRow[]>();
+  for (const row of reactions) {
+    if (row.commentId === null) continue;
+    const bucket = byComment.get(row.commentId) ?? [];
+    bucket.push(row);
+    byComment.set(row.commentId, bucket);
+  }
+
+  return {
+    comments: comments.map((comment) => ({
+      comment,
+      reactions: byComment.get(comment.id) ?? [],
+    })),
+    nextCursor,
+  };
+}
+
+function commentAction(
+  row: CommentRow,
+  issue: { organizationId: string; teamId: string; id: string },
+  syncId: number,
+  actor: Awaited<ReturnType<typeof principalActor>>,
+  action: 'insert' | 'update' | 'delete',
+): SyncAction {
+  return buildSyncAction({
+    syncId,
+    organizationId: row.organizationId,
+    scopes: commentScopes(issue),
+    action,
+    model: 'comment',
+    modelId: row.id,
+    data: row,
+    actor,
+  });
+}
+
+export interface CreatedComment {
+  readonly comment: CommentRow;
+  readonly actions: SyncAction[];
+}
+
+async function commentNotifications(
+  tx: Executor,
+  principal: Principal,
+  issue: { organizationId: string; teamId: string; id: string; identifier: string },
+  comment: CommentRow,
+  actor: Actor,
+): Promise<SyncAction[]> {
+  const [mentioned, repliedTo, subscribers] = await Promise.all([
+    resolveMentions(tx, principal.organizationId, comment.body, issue.teamId),
+    comment.parentId === null
+      ? Promise.resolve<string[]>([])
+      : commentThreadAuthors(tx, comment.parentId),
+    issueSubscriberIds(tx, issue.id),
+  ]);
+
+  const audience = dedupeAudience(
+    [
+      {
+        type: 'mention' as const,
+        reason: 'mentioned' as const,
+        title: `Mentioned you in ${issue.identifier}`,
+        userIds: mentioned,
+      },
+      {
+        type: 'comment_replied' as const,
+        reason: 'commented' as const,
+        title: `New reply on ${issue.identifier}`,
+        userIds: repliedTo,
+      },
+      {
+        type: 'comment_created' as const,
+        reason: 'subscribed' as const,
+        title: `New comment on ${issue.identifier}`,
+        userIds: subscribers,
+      },
+    ],
+    [principal.userId],
+  );
+
+  const readers = await teamReaderIds(
+    tx,
+    issue.organizationId,
+    issue.teamId,
+    audience.flatMap((group) => group.userIds),
+  );
+
+  const events: NotificationEvent[] = restrictAudience(audience, readers).map((group) => ({
+    organizationId: issue.organizationId,
+    type: group.type,
+    reason: group.reason,
+    actor,
+    entityType: 'comment',
+    entityId: comment.id,
+    userIds: [...group.userIds],
+    title: group.title,
+    body: truncate(comment.body, NOTIFICATION_BODY_LIMIT),
+    url: issueCommentUrl(issue.identifier, comment.id),
+    source: {
+      sourceEventKey: `tack-comment:${comment.id}:created`,
+      subjectType: 'issue',
+      subjectKey: `tack-issue:${issue.id}:activity`,
+      occurredAt: comment.createdAt,
+      teamIds: [issue.teamId],
+      payload: { commentId: comment.id, issueId: issue.id, action: 'created' },
+    },
+  }));
+
+  return await notifyRecipients(tx, events);
+}
+
+export async function createComment(
+  principal: Principal,
+  issueId: string,
+  input: unknown,
+): Promise<CreatedComment> {
+  assertCan(principal, 'comment:create');
+  const parsed = commentCreateSchema.parse(input);
+
+  return await db.transaction(async (tx) => {
+    const issue = await loadIssueForComment(tx, principal, issueId);
+
+    if (parsed.parentId !== null) {
+      const parent = await loadComment(tx, principal, parsed.parentId);
+      if (parent.issueId !== issueId) {
+        throw validationFailed('That reply belongs to another issue.');
+      }
+      if (parent.parentId !== null) {
+        throw validationFailed('Replies only nest one level deep.');
+      }
+    }
+
+    const syncId = await nextSyncId(tx);
+    const actor = await principalActor(tx, principal);
+    const [created] = await tx
+      .insert(schema.comment)
+      .values({
+        id: newId(),
+        organizationId: principal.organizationId,
+        issueId,
+        authorId: principal.userId,
+        parentId: parsed.parentId,
+        body: parsed.body,
+        syncId,
+      })
+      .returning();
+    const comment = requireRow(created, 'The comment could not be created.');
+
+    const notifications = await commentNotifications(tx, principal, issue, comment, actor);
+
+    await tx
+      .insert(schema.issueSubscription)
+      .values({ id: newId(), issueId, userId: principal.userId })
+      .onConflictDoNothing();
+
+    return {
+      comment,
+      actions: [commentAction(comment, issue, syncId, actor, 'insert'), ...notifications],
+    };
+  });
+}
+
+export async function updateComment(
+  principal: Principal,
+  commentId: string,
+  input: unknown,
+): Promise<CreatedComment> {
+  assertCan(principal, 'comment:update:own');
+  const parsed = commentUpdateSchema.parse(input);
+
+  return await db.transaction(async (tx) => {
+    const current = await loadComment(tx, principal, commentId);
+    if (current.authorId !== principal.userId) {
+      throw forbidden('You can only edit your own comments.');
+    }
+    const issue = await loadIssueForComment(tx, principal, current.issueId);
+
+    const now = new Date();
+    const syncId = await nextSyncId(tx);
+    const actor = await principalActor(tx, principal);
+    const [updated] = await tx
+      .update(schema.comment)
+      .set({ body: parsed.body, editedAt: now, updatedAt: now, syncId })
+      .where(eq(schema.comment.id, commentId))
+      .returning();
+    const comment = requireRow(updated, 'That comment does not exist.');
+
+    return { comment, actions: [commentAction(comment, issue, syncId, actor, 'update')] };
+  });
+}
+
+export async function deleteComment(
+  principal: Principal,
+  commentId: string,
+): Promise<SyncAction[]> {
+  return await db.transaction(async (tx) => {
+    const current = await loadComment(tx, principal, commentId);
+    const owned = current.authorId === principal.userId;
+    if (owned) assertCan(principal, 'comment:update:own');
+    else assertCan(principal, 'comment:delete:any');
+
+    const issue = await loadIssueForComment(tx, principal, current.issueId);
+    const now = new Date();
+    const syncId = await nextSyncId(tx);
+    const actor = await principalActor(tx, principal);
+    const [deleted] = await tx
+      .update(schema.comment)
+      .set({ deletedAt: now, updatedAt: now, syncId })
+      .where(eq(schema.comment.id, commentId))
+      .returning();
+    const comment = requireRow(deleted, 'That comment does not exist.');
+
+    return [commentAction(comment, issue, syncId, actor, 'delete')];
+  });
+}
+
+export interface ToggledReaction {
+  readonly emoji: string;
+  readonly active: boolean;
+  readonly actions: SyncAction[];
+}
+
+export async function toggleReaction(
+  principal: Principal,
+  commentId: string,
+  input: unknown,
+): Promise<ToggledReaction> {
+  assertCan(principal, 'reaction:toggle');
+  const parsed = reactionSchema.parse(input);
+
+  return await db.transaction(async (tx) => {
+    const current = await loadComment(tx, principal, commentId);
+    const issue = await loadIssueForComment(tx, principal, current.issueId);
+    const syncId = await nextSyncId(tx);
+    const actor = await principalActor(tx, principal);
+
+    const removed = await tx
+      .delete(schema.reaction)
+      .where(
+        and(
+          eq(schema.reaction.commentId, commentId),
+          eq(schema.reaction.userId, principal.userId),
+          eq(schema.reaction.emoji, parsed.emoji),
+        ),
+      )
+      .returning();
+
+    if (removed.length > 0) {
+      const row = removed[0];
+      if (row === undefined) throw notFound('That reaction does not exist.');
+      return {
+        emoji: parsed.emoji,
+        active: false,
+        actions: [
+          buildSyncAction({
+            syncId,
+            organizationId: principal.organizationId,
+            scopes: commentScopes(issue),
+            action: 'delete',
+            model: 'reaction',
+            modelId: row.id,
+            data: { ...row, commentId },
+            actor,
+          }),
+        ],
+      };
+    }
+
+    const [created] = await tx
+      .insert(schema.reaction)
+      .values({
+        id: newId(),
+        organizationId: principal.organizationId,
+        commentId,
+        issueId: current.issueId,
+        userId: principal.userId,
+        emoji: parsed.emoji,
+        syncId,
+      })
+      .returning();
+    const reaction = requireRow(created, 'The reaction could not be saved.');
+
+    return {
+      emoji: parsed.emoji,
+      active: true,
+      actions: [
+        buildSyncAction({
+          syncId,
+          organizationId: principal.organizationId,
+          scopes: commentScopes(issue),
+          action: 'insert',
+          model: 'reaction',
+          modelId: reaction.id,
+          data: reaction,
+          actor,
+        }),
+      ],
+    };
+  });
+}

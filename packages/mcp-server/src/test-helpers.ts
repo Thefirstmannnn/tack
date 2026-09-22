@@ -1,0 +1,198 @@
+import { randomUUID } from 'node:crypto';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import {
+  bindMcpCredential,
+  createOrganization,
+  recordMcpGrant,
+  resolvePrincipal,
+  unbindMcpCredential,
+} from '@tack/core';
+import { db, schema, sql } from '@tack/db';
+import type { OrgRole } from '@tack/shared/constants';
+import type { Principal } from '@tack/shared/policy';
+import { handleMcpRequest, MCP_PATH } from './server.ts';
+
+const TEST_DATABASE_NAME = /^tack_test(?:_[a-z0-9]+)*$/;
+const MCP_TEST_SECRET = 'dev-secret-change-me-in-production-0123456789abcdef';
+
+function mcpTestSecret(): string {
+  const configured = process.env['BETTER_AUTH_SECRET'];
+  if (configured !== undefined && configured.length > 0) return configured;
+  process.env['BETTER_AUTH_SECRET'] = MCP_TEST_SECRET;
+  return MCP_TEST_SECRET;
+}
+
+export async function resetDatabase(): Promise<void> {
+  const [current] = await db.execute<{ name: string }>(sql`select current_database() as name`);
+  if (current === undefined || !TEST_DATABASE_NAME.test(String(current['name']))) {
+    throw new Error(
+      `resetDatabase refuses to truncate "${current?.['name'] ?? 'unknown'}". Point DATABASE_URL at a database matching ${String(TEST_DATABASE_NAME)}.`,
+    );
+  }
+  const rows = await db.execute<{ tablename: string }>(
+    sql`select tablename from pg_tables where schemaname = 'public' order by tablename`,
+  );
+  const tables = rows.map((row) => `"${row['tablename']}"`).join(', ');
+  if (tables.length === 0) return;
+  await db.execute(sql.raw(`truncate table ${tables} restart identity cascade`));
+  await db.execute(sql`select setval('sync_id_seq', 1, false)`);
+}
+
+export async function createUser(name: string): Promise<typeof schema.user.$inferSelect> {
+  const id = randomUUID();
+  const handle = `${name.toLowerCase().replace(/[^a-z0-9]/g, '')}-${id.slice(0, 8)}`;
+  const [row] = await db
+    .insert(schema.user)
+    .values({ id, name, email: `${handle}@tack.test`, handle, emailVerified: true })
+    .returning();
+  if (row === undefined) throw new Error('Could not create the test user.');
+  return row;
+}
+
+export interface TestWorkspace {
+  readonly organizationId: string;
+  readonly teamId: string;
+  readonly teamKey: string;
+  readonly admin: Principal;
+  readonly adminUser: typeof schema.user.$inferSelect;
+}
+
+export async function createWorkspace(name = 'Nova'): Promise<TestWorkspace> {
+  const adminUser = await createUser('Ada Admin');
+  const bootstrap = await createOrganization(adminUser.id, {
+    name,
+    slug: `${name.toLowerCase()}-${randomUUID().slice(0, 8)}`,
+  });
+  const admin = await resolvePrincipal(adminUser.id, bootstrap.organization.id);
+  return {
+    organizationId: bootstrap.organization.id,
+    teamId: bootstrap.team.id,
+    teamKey: bootstrap.team.key,
+    admin,
+    adminUser,
+  };
+}
+
+export async function addMember(
+  workspace: TestWorkspace,
+  role: OrgRole,
+  name = `${role} person`,
+): Promise<{ principal: Principal; user: typeof schema.user.$inferSelect }> {
+  const user = await createUser(name);
+  await db.insert(schema.member).values({
+    id: randomUUID(),
+    organizationId: workspace.organizationId,
+    userId: user.id,
+    role,
+  });
+  await db
+    .insert(schema.teamMember)
+    .values({ id: randomUUID(), teamId: workspace.teamId, userId: user.id });
+  const principal = await resolvePrincipal(user.id, workspace.organizationId);
+  return { principal, user };
+}
+
+export const MCP_TEST_SCOPES = 'openid profile email tack.read tack.write';
+
+function token(prefix: string): string {
+  return `${prefix}${randomUUID().replace(/-/g, '')}${randomUUID().replace(/-/g, '')}`;
+}
+
+export async function mintToken(
+  organizationId: string,
+  userId: string,
+  name = 'Test client',
+  scopes: string = MCP_TEST_SCOPES,
+): Promise<string> {
+  const secret = mcpTestSecret();
+  const clientId = `tack_test_${randomUUID().replace(/-/g, '')}`;
+  await db.insert(schema.oauthApplication).values({
+    id: randomUUID(),
+    name,
+    clientId,
+    redirectUrls: 'http://127.0.0.1:4321/callback',
+    type: 'public',
+    userId,
+  });
+  const grantId = await recordMcpGrant({ clientId, userId, organizationId, scopes });
+  const accessToken = token('at_');
+  await db.insert(schema.oauthAccessToken).values({
+    id: randomUUID(),
+    accessToken,
+    refreshToken: token('rt_'),
+    accessTokenExpiresAt: new Date(Date.now() + 3_600_000),
+    refreshTokenExpiresAt: new Date(Date.now() + 86_400_000),
+    clientId,
+    userId,
+    scopes,
+  });
+  return bindMcpCredential(accessToken, grantId, secret);
+}
+
+export function rawTokenOf(tokenValue: string): string {
+  const binding = unbindMcpCredential(tokenValue, mcpTestSecret());
+  if (binding === null) throw new Error('The test token has no MCP grant binding.');
+  return binding.credential;
+}
+
+export interface TestClient {
+  readonly client: Client;
+  call(name: string, args?: Record<string, unknown>): Promise<CallToolResult>;
+  result(name: string, args?: Record<string, unknown>): Promise<Record<string, unknown>>;
+  close(): Promise<void>;
+}
+
+function payloadOf(result: CallToolResult): Record<string, unknown> {
+  const [first] = result.content;
+  if (first === undefined || first.type !== 'text') {
+    throw new Error('The tool returned no text content.');
+  }
+  const parsed: unknown = JSON.parse(first.text);
+  if (typeof parsed !== 'object' || parsed === null)
+    throw new Error('The tool returned no object.');
+  return parsed as Record<string, unknown>;
+}
+
+export const MCP_TEST_PUBLIC_URL = 'http://localhost:3000';
+export const MCP_TEST_ORIGIN = 'http://mcp.test';
+
+export function callMcp(request: Request): Promise<Response> {
+  return handleMcpRequest(request, { publicUrl: MCP_TEST_PUBLIC_URL });
+}
+
+function directFetch(url: string | URL, init?: RequestInit): Promise<Response> {
+  return callMcp(new Request(typeof url === 'string' ? url : url.toString(), init));
+}
+
+export async function connect(accessToken: string): Promise<TestClient> {
+  const client = new Client({ name: 'tack-test', version: '0.0.0' });
+  const transport = new StreamableHTTPClientTransport(new URL(`${MCP_TEST_ORIGIN}${MCP_PATH}`), {
+    requestInit: { headers: { authorization: `Bearer ${accessToken}` } },
+    fetch: directFetch,
+  });
+  await client.connect(transport as unknown as Transport);
+  return {
+    client,
+    call: (name, args = {}) =>
+      client.callTool({ name, arguments: args }) as Promise<CallToolResult>,
+    async result(name, args = {}) {
+      const called = (await client.callTool({ name, arguments: args })) as CallToolResult;
+      if (called.isError === true) {
+        throw new Error(`tool ${name} failed: ${JSON.stringify(called.content)}`);
+      }
+      return payloadOf(called);
+    },
+    close: () => client.close(),
+  };
+}
+
+export function errorPayload(result: CallToolResult): { code: string; message: string } {
+  const parsed = payloadOf(result);
+  const error = parsed['error'];
+  if (typeof error !== 'object' || error === null) throw new Error('No error payload.');
+  const shape = error as { code?: unknown; message?: unknown };
+  return { code: String(shape.code), message: String(shape.message) };
+}

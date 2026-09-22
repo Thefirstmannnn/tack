@@ -1,0 +1,317 @@
+'use client';
+
+import type { OrgRole } from '@tack/shared/constants';
+import {
+  conditionsOf,
+  dropLastCondition,
+  isEmptyFilter,
+  viewStateDirty,
+} from '@tack/shared/filters';
+import { Columns3, List, SearchX } from 'lucide-react';
+import Link from 'next/link';
+import { useRouter, useSearchParams } from 'next/navigation';
+import { useMemo } from 'react';
+import { Button } from '@/components/ui/button.tsx';
+import { EmptyState } from '@/components/ui/empty-state.tsx';
+import { FilterBar } from '@/features/filters/filter-bar.tsx';
+import type { IssueGroup } from '@/features/filters/grouping.ts';
+import { HiddenFooter } from '@/features/filters/hidden-footer.tsx';
+import { useViewConfig, VIEW_PARAM } from '@/features/filters/use-view-config.ts';
+import type { ViewConfig, ViewLayoutMode } from '@/features/filters/view-config.ts';
+import { viewConfigToState } from '@/features/filters/view-config.ts';
+import { useProvideViewControls } from '@/features/filters/view-controls.tsx';
+import { LoadFailed } from '@/features/issues/load-failed.tsx';
+import { cn } from '@/lib/cn.ts';
+import { useHotkey } from '@/lib/keyboard/index.ts';
+import { columnParamFor } from '@/lib/query/issue-search.ts';
+import type { View, WorkflowState } from '@/lib/query/schemas.ts';
+import { useIssues } from '@/lib/query/use-issues.ts';
+import { useViews } from '@/lib/query/use-views.ts';
+import { Board, boardVisibilityConfig, canDragBoard, useBoardVisibilityHold } from './board.tsx';
+import { IssueList } from './issue-list.tsx';
+import { ListSkeleton } from './list-skeleton.tsx';
+import { useIssueViewModel } from './use-issue-view-model.ts';
+import { useWorkspace } from './workspace-provider.tsx';
+
+export interface TeamViewProps {
+  readonly teamKey: string;
+  readonly layout: ViewLayoutMode;
+}
+
+export function TeamView({ teamKey, layout }: TeamViewProps) {
+  const router = useRouter();
+  const workspace = useWorkspace();
+  const searchParams = useSearchParams();
+  const team = workspace.teams.find((entry) => entry.key.toLowerCase() === teamKey.toLowerCase());
+  const teamId = team?.id ?? null;
+
+  const { config, setConfig } = useViewConfig(teamId, layout, 'team');
+  const controls = useProvideViewControls('team', layout, config);
+  const filtered = !isEmptyFilter(config.filter);
+
+  const seed = workspace.seedIssues.filter((issue) => issue.teamId === teamId);
+  const issues = useIssues(teamId, filtered || seed.length === 0 ? undefined : seed, {
+    filter: config.filter,
+    orderBy: config.orderBy,
+  });
+
+  const views = useViews();
+  const savedView = useSavedView(views.data ?? [], searchParams.get(VIEW_PARAM));
+
+  const rows = useMemo(() => issues.data ?? [], [issues.data]);
+  const model = useIssueViewModel({ teamId, config, issues: rows });
+  const boardVisibility = useBoardVisibilityHold(
+    JSON.stringify([teamId, layout, boardVisibilityConfig(config), workspace.role]),
+    model.shownCount === 0,
+  );
+
+  const other = layout === 'board' ? 'issues' : 'board';
+  useHotkey(
+    'mod+b',
+    () => {
+      router.push(`/team/${teamKey.toLowerCase()}/${other}`);
+    },
+    { label: 'Toggle board and list', section: 'View', scope: 'issues' },
+  );
+
+  if (!workspace.ready) return <ListSkeleton layout={layout} />;
+
+  if (team === undefined || teamId === null) {
+    return (
+      <EmptyState
+        icon={<List strokeWidth={1.75} aria-hidden="true" />}
+        title="No such team"
+        description={`Nothing here matches "${teamKey}".`}
+      />
+    );
+  }
+
+  const clearFilters = () => setConfig({ ...config, filter: { ...config.filter, children: [] } });
+  const revealDisplay = () =>
+    setConfig({
+      ...config,
+      display: { ...config.display, showSubIssues: true, showCompleted: 'all' },
+    });
+
+  return (
+    <div className="flex h-full min-h-0 flex-col">
+      <div className="flex items-center gap-2 border-border border-b px-3 py-2">
+        <h1 className="font-medium text-dense text-text">{team.name}</h1>
+        <span data-numeric className="text-2xs text-faint" data-testid="issue-count">
+          {model.total}
+        </span>
+        <div className="ml-auto flex items-center gap-1">
+          <ViewToggle teamKey={teamKey} layout={layout} />
+          <Button
+            size="sm"
+            variant="primary"
+            onClick={() => workspace.openQuickCreate(teamId)}
+            data-testid="new-issue"
+          >
+            New issue
+          </Button>
+        </div>
+      </div>
+
+      <FilterBar
+        teamId={teamId}
+        teamName={team.name}
+        layout={layout}
+        config={config}
+        onChange={setConfig}
+        controls={controls}
+        facets={model.facets}
+        savedView={savedView}
+        dirty={savedView !== null && isDirty(config, layout, savedView)}
+      />
+
+      <TeamContent
+        boardVisibilityKey={boardVisibility.key}
+        teamId={teamId}
+        role={workspace.role}
+        states={model.states}
+        groups={model.groups}
+        config={config}
+        layout={layout}
+        filtered={model.filtered}
+        empty={model.shownCount === 0}
+        loading={issues.isPending}
+        failed={issues.isError}
+        onRetry={() => {
+          issues.refetch().catch(() => undefined);
+        }}
+        hasMore={issues.hasNextPage}
+        loadingMore={issues.isFetchingNextPage}
+        onLoadMore={() => {
+          issues.fetchNextPage().catch(() => undefined);
+        }}
+        onClearLastFilter={() => setConfig({ ...config, filter: dropLastCondition(config.filter) })}
+        keepBoardMounted={boardVisibility.held}
+        onVisibilityActivityStart={boardVisibility.start}
+      />
+
+      <HiddenFooter
+        hiddenByFilters={model.hiddenByFilters}
+        hiddenByDisplay={model.hiddenByDisplay}
+        onClearFilters={clearFilters}
+        onRevealDisplay={revealDisplay}
+      />
+    </div>
+  );
+}
+
+function useSavedView(views: readonly View[], viewId: string | null): View | null {
+  return useMemo(
+    () => (viewId === null ? null : (views.find((entry) => entry.id === viewId) ?? null)),
+    [views, viewId],
+  );
+}
+
+function isDirty(config: ViewConfig, layout: ViewLayoutMode, view: View): boolean {
+  const current = viewConfigToState(config, layout, {
+    teamId: view.filter.teamId,
+    projectId: view.filter.projectId,
+  });
+  return viewStateDirty(current, view.filter);
+}
+
+interface TeamContentProps {
+  readonly boardVisibilityKey: string;
+  readonly teamId: string;
+  readonly role: OrgRole;
+  readonly states: readonly WorkflowState[];
+  readonly groups: readonly IssueGroup[];
+  readonly config: ViewConfig;
+  readonly layout: ViewLayoutMode;
+  readonly filtered: boolean;
+  readonly empty: boolean;
+  readonly loading: boolean;
+  readonly failed: boolean;
+  readonly onRetry: () => void;
+  readonly hasMore: boolean;
+  readonly loadingMore: boolean;
+  readonly onLoadMore: () => void;
+  readonly onClearLastFilter: () => void;
+  readonly keepBoardMounted: boolean;
+  readonly onVisibilityActivityStart: () => () => void;
+}
+
+function TeamContent({
+  boardVisibilityKey,
+  teamId,
+  role,
+  states,
+  groups,
+  config,
+  layout,
+  filtered,
+  empty,
+  loading,
+  failed,
+  onRetry,
+  hasMore,
+  loadingMore,
+  onLoadMore,
+  onClearLastFilter,
+  keepBoardMounted,
+  onVisibilityActivityStart,
+}: TeamContentProps) {
+  if (loading) return <ListSkeleton layout={layout} />;
+
+  if (failed)
+    return <LoadFailed subject="these issues" onRetry={onRetry} testId="retry-team-issues" />;
+
+  const showEmptyState = empty && !(layout === 'board' && keepBoardMounted);
+
+  if (showEmptyState && conditionsOf(config.filter).length > 0) {
+    return (
+      <EmptyState
+        icon={<SearchX strokeWidth={1.75} aria-hidden="true" />}
+        title="No issues match these filters"
+        description="Loosen a filter to widen the search."
+        className="flex-1"
+        action={
+          <Button size="sm" data-testid="clear-last-filter" onClick={onClearLastFilter}>
+            Clear the last filter
+          </Button>
+        }
+      />
+    );
+  }
+
+  if (showEmptyState) {
+    return (
+      <EmptyState
+        icon={<Columns3 strokeWidth={1.75} aria-hidden="true" />}
+        title="No issues yet"
+        description="Press C to create the first one."
+        className="flex-1"
+      />
+    );
+  }
+
+  if (layout === 'board') {
+    return (
+      <Board
+        key={boardVisibilityKey}
+        groups={groups}
+        draggable={canDragBoard(role, config.groupBy)}
+        reorderable={config.orderBy === 'manual'}
+        groupBy={config.groupBy}
+        properties={config.display.properties}
+        hasMore={hasMore}
+        loadingMore={loadingMore}
+        onLoadMore={onLoadMore}
+        filtered={filtered}
+        onVisibilityActivityStart={onVisibilityActivityStart}
+        columnSource={
+          columnParamFor(config.groupBy) === null
+            ? undefined
+            : {
+                query: { filter: config.filter, orderBy: config.orderBy },
+                groupBy: config.groupBy,
+                scope: { teamId },
+                display: config.display,
+              }
+        }
+      />
+    );
+  }
+  return (
+    <IssueList
+      states={states}
+      groups={groups}
+      properties={config.display.properties}
+      hasMore={hasMore}
+      loadingMore={loadingMore}
+      onLoadMore={onLoadMore}
+    />
+  );
+}
+
+function ViewToggle({ teamKey, layout }: { teamKey: string; layout: ViewLayoutMode }) {
+  const base = `/team/${teamKey.toLowerCase()}`;
+  const itemClass =
+    'flex h-7 items-center gap-1.5 rounded-md px-2 text-2xs transition-colors duration-[var(--duration-fast)]';
+
+  return (
+    <div className="flex items-center gap-0.5 rounded-md border border-border p-0.5">
+      <Link
+        href={`${base}/issues`}
+        data-testid="view-list"
+        className={cn(itemClass, layout === 'list' ? 'bg-surface-2 text-text' : 'text-faint')}
+      >
+        <List className="size-3.5" aria-hidden="true" />
+        List
+      </Link>
+      <Link
+        href={`${base}/board`}
+        data-testid="view-board"
+        className={cn(itemClass, layout === 'board' ? 'bg-surface-2 text-text' : 'text-faint')}
+      >
+        <Columns3 className="size-3.5" aria-hidden="true" />
+        Board
+      </Link>
+    </div>
+  );
+}

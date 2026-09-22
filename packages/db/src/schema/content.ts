@@ -1,0 +1,357 @@
+import type { DocCommentAnchor } from '@tack/shared/validators';
+import { sql } from 'drizzle-orm';
+import {
+  type AnyPgColumn,
+  bigint,
+  boolean,
+  doublePrecision,
+  index,
+  integer,
+  jsonb,
+  pgTable,
+  text,
+  timestamp,
+  uniqueIndex,
+} from 'drizzle-orm/pg-core';
+import { user } from './auth.ts';
+import { organization } from './org.ts';
+import { tsvector } from './types.ts';
+import { issue, project } from './work.ts';
+
+export const comment = pgTable(
+  'comment',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    issueId: text('issue_id')
+      .notNull()
+      .references(() => issue.id, { onDelete: 'cascade' }),
+    authorId: text('author_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'restrict' }),
+    parentId: text('parent_id'),
+    body: text('body').notNull(),
+    editedAt: timestamp('edited_at', { withTimezone: true }),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    deletedAt: timestamp('deleted_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('comment_issue_idx').on(table.issueId, table.createdAt),
+    index('comment_parent_idx').on(table.parentId),
+  ],
+);
+
+export const reaction = pgTable(
+  'reaction',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    commentId: text('comment_id').references(() => comment.id, { onDelete: 'cascade' }),
+    issueId: text('issue_id').references(() => issue.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    emoji: text('emoji').notNull(),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('reaction_comment_unique').on(table.commentId, table.userId, table.emoji),
+    index('reaction_comment_idx').on(table.commentId),
+    index('reaction_issue_idx').on(table.issueId),
+  ],
+);
+
+export const docCollection = pgTable(
+  'doc_collection',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    name: text('name').notNull(),
+    icon: text('icon').notNull().default('book'),
+    position: doublePrecision('position').notNull().default(0),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index('doc_collection_org_idx').on(table.organizationId, table.position)],
+);
+
+export const docAccess = pgTable(
+  'doc_access',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    docId: text('doc_id')
+      .notNull()
+      .references((): AnyPgColumn => doc.id, { onDelete: 'cascade' }),
+    subjectType: text('subject_type').notNull(),
+    subjectId: text('subject_id').notNull(),
+    level: text('level').notNull().default('read'),
+    grantedById: text('granted_by_id').references(() => user.id, { onDelete: 'set null' }),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('doc_access_unique').on(table.docId, table.subjectType, table.subjectId),
+    index('doc_access_subject_idx').on(table.subjectType, table.subjectId),
+  ],
+);
+
+export const doc = pgTable(
+  'doc',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    collectionId: text('collection_id').references(() => docCollection.id, {
+      onDelete: 'set null',
+    }),
+    parentId: text('parent_id').references((): AnyPgColumn => doc.id, { onDelete: 'set null' }),
+    projectId: text('project_id').references(() => project.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    slug: text('slug').notNull().default(''),
+    kind: text('kind').notNull().default('markdown'),
+    content: text('content').notNull().default(''),
+    sortOrder: doublePrecision('sort_order').notNull().default(0),
+    searchVector: tsvector('search_vector').generatedAlwaysAs(
+      sql`setweight(to_tsvector('english', coalesce(title, '')), 'A') || setweight(to_tsvector('english', left(coalesce(content, ''), 200000)), 'B')`,
+    ),
+    visibility: text('visibility').notNull().default('workspace'),
+    publishToken: text('publish_token').unique(),
+    authorId: text('author_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'restrict' }),
+    repoBinding: jsonb('repo_binding').$type<{
+      repo: string;
+      path: string;
+      branch: string;
+      syncedAt: string;
+    } | null>(),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    archivedAt: timestamp('archived_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('doc_org_idx').on(table.organizationId),
+    index('doc_project_idx').on(table.projectId),
+    index('doc_parent_idx').on(table.parentId),
+    index('doc_collection_order_idx').on(table.collectionId, table.sortOrder),
+    index('doc_title_trgm_idx').using('gin', table.title.op('gin_trgm_ops')),
+    index('doc_content_trgm_idx').using('gin', table.content.op('gin_trgm_ops')),
+    index('doc_search_idx').using('gin', table.searchVector),
+  ],
+);
+
+export const docAccessRequest = pgTable(
+  'doc_access_request',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    docId: text('doc_id')
+      .notNull()
+      .references((): AnyPgColumn => doc.id, { onDelete: 'cascade' }),
+    requesterId: text('requester_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    message: text('message'),
+    status: text('status').notNull().default('pending'),
+    decidedById: text('decided_by_id').references(() => user.id, { onDelete: 'set null' }),
+    decidedAt: timestamp('decided_at', { withTimezone: true }),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('doc_access_request_pending_unique')
+      .on(table.docId, table.requesterId)
+      .where(sql`status = 'pending'`),
+    index('doc_access_request_doc_idx').on(table.docId, table.createdAt),
+    index('doc_access_request_requester_idx').on(table.requesterId),
+  ],
+);
+
+export const docVersion = pgTable(
+  'doc_version',
+  {
+    id: text('id').primaryKey(),
+    docId: text('doc_id')
+      .notNull()
+      .references(() => doc.id, { onDelete: 'cascade' }),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    title: text('title').notNull(),
+    content: text('content').notNull(),
+    ownedById: text('owned_by_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    restoredFromId: text('restored_from_id'),
+    lastSavedAt: timestamp('last_saved_at', { withTimezone: true }).notNull().defaultNow(),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index('doc_version_doc_idx').on(table.docId, table.lastSavedAt)],
+);
+
+export const docComment = pgTable(
+  'doc_comment',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    docId: text('doc_id')
+      .notNull()
+      .references(() => doc.id, { onDelete: 'cascade' }),
+    authorId: text('author_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'restrict' }),
+    parentId: text('parent_id').references((): AnyPgColumn => docComment.id, {
+      onDelete: 'set null',
+    }),
+    body: text('body').notNull(),
+    anchor: jsonb('anchor').$type<DocCommentAnchor | null>(),
+    editedAt: timestamp('edited_at', { withTimezone: true }),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+    deletedAt: timestamp('deleted_at', { withTimezone: true }),
+  },
+  (table) => [
+    index('doc_comment_doc_idx').on(table.docId, table.createdAt),
+    index('doc_comment_parent_idx').on(table.parentId),
+  ],
+);
+
+export const attachment = pgTable(
+  'attachment',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    parentType: text('parent_type').notNull(),
+    parentId: text('parent_id').notNull(),
+    fileName: text('file_name').notNull(),
+    contentType: text('content_type').notNull(),
+    size: bigint('size', { mode: 'number' }).notNull(),
+    storageKey: text('storage_key').notNull().unique(),
+    status: text('status').notNull().default('pending'),
+    width: bigint('width', { mode: 'number' }),
+    height: bigint('height', { mode: 'number' }),
+    durationSeconds: bigint('duration_seconds', { mode: 'number' }),
+    uploadExpiresAt: timestamp('upload_expires_at', { withTimezone: true }).default(
+      sql`now() + interval '900 seconds'`,
+    ),
+    uploadedById: text('uploaded_by_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'restrict' }),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [index('attachment_parent_idx').on(table.parentType, table.parentId)],
+);
+
+export const favorite = pgTable(
+  'favorite',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    entityType: text('entity_type').notNull(),
+    entityId: text('entity_id').notNull(),
+    sortOrder: doublePrecision('sort_order').notNull().default(1024),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('favorite_unique').on(table.userId, table.entityType, table.entityId),
+    index('favorite_user_idx').on(table.userId, table.sortOrder),
+  ],
+);
+
+export const recentVisit = pgTable(
+  'recent_visit',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    entityType: text('entity_type').notNull(),
+    entityId: text('entity_id').notNull(),
+    visitedAt: timestamp('visited_at', { withTimezone: true }).notNull().defaultNow(),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('recent_visit_unique').on(
+      table.userId,
+      table.organizationId,
+      table.entityType,
+      table.entityId,
+    ),
+    index('recent_visit_user_idx').on(table.userId, table.visitedAt),
+  ],
+);
+
+export const homeWidgetPreference = pgTable(
+  'home_widget_preference',
+  {
+    id: text('id').primaryKey(),
+    organizationId: text('organization_id')
+      .notNull()
+      .references(() => organization.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    widget: text('widget').notNull(),
+    position: integer('position').notNull().default(0),
+    enabled: boolean('enabled').notNull().default(true),
+    config: jsonb('config').$type<Record<string, unknown>>().notNull().default({}),
+    syncId: bigint('sync_id', { mode: 'number' }).notNull().default(0),
+    createdAt: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (table) => [
+    uniqueIndex('home_widget_preference_unique').on(
+      table.userId,
+      table.organizationId,
+      table.widget,
+    ),
+  ],
+);
+
+export const docSubscription = pgTable(
+  'doc_subscription',
+  {
+    id: text('id').primaryKey(),
+    docId: text('doc_id')
+      .notNull()
+      .references(() => doc.id, { onDelete: 'cascade' }),
+    userId: text('user_id')
+      .notNull()
+      .references(() => user.id, { onDelete: 'cascade' }),
+    muted: boolean('muted').notNull().default(false),
+  },
+  (table) => [uniqueIndex('doc_subscription_unique').on(table.docId, table.userId)],
+);

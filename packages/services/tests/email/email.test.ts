@@ -1,0 +1,266 @@
+import { describe, expect, it } from 'bun:test';
+import { emailDelivery } from '@tack/db/schema';
+import { DomainError } from '@tack/shared';
+import { randomUUIDv7 } from '@tack/shared/utils';
+import { eq } from 'drizzle-orm';
+import {
+  commentEmail,
+  createEmailTransport,
+  digestEmail,
+  type EmailMessage,
+  type EmailSendResult,
+  type EmailTransport,
+  inviteAcceptedEmail,
+  inviteEmail,
+  issueAssignedEmail,
+  mentionEmail,
+  ResendTransport,
+  resetPasswordEmail,
+  sendEmail,
+  signInCodeEmail,
+} from '../../src/email/index.ts';
+import { withRollback } from '../../src/test-database.ts';
+
+class RecordingTransport implements EmailTransport {
+  readonly sent: EmailMessage[] = [];
+  constructor(private readonly failure: Error | null = null) {}
+  send(message: EmailMessage): Promise<EmailSendResult> {
+    if (this.failure !== null) return Promise.reject(this.failure);
+    this.sent.push(message);
+    return Promise.resolve({ providerId: `prov_${this.sent.length}` });
+  }
+}
+
+describe('templates', () => {
+  it('renders the sign in code in html and text', async () => {
+    const content = await signInCodeEmail({
+      code: '123456',
+      email: 'ada@tack.local',
+    });
+    expect(content.subject).toBe('Your Tack sign in code');
+    expect(content.html).toContain('123456');
+    expect(content.html).toContain('#5A63C8');
+    expect(content.html).toContain('expires in five minutes');
+    expect(content.html).toContain('can be used once');
+    expect(content.text).toContain('123456');
+    expect(content.text).toContain('expires in five minutes');
+    expect(content.text).toContain('can be used once');
+    expect(content.text).toContain('ada@tack.local');
+  });
+
+  it('renders the reset password email with the url in html and text', async () => {
+    const content = await resetPasswordEmail({
+      url: 'https://tack.local/api/auth/reset-password/tok123?callbackURL=/reset-password',
+      email: 'ada@tack.local',
+    });
+    expect(content.subject).toBe('Reset your Tack password');
+    expect(content.html).toContain(
+      'https://tack.local/api/auth/reset-password/tok123?callbackURL=/reset-password',
+    );
+    expect(content.text).toContain('reset-password/tok123');
+    expect(content.text).toContain('ada@tack.local');
+  });
+
+  it('renders the invite email', async () => {
+    const content = await inviteEmail({
+      organizationName: 'Acme',
+      inviterName: 'Ada',
+      role: 'admin',
+      acceptUrl: 'https://tack.local/invite/xyz',
+    });
+    expect(content.subject).toBe('Ada invited you to Acme on Tack');
+    expect(content.html).toContain('https://tack.local/invite/xyz');
+    expect(content.text).toContain('admin');
+  });
+
+  it('renders the invite accepted email', async () => {
+    const content = await inviteAcceptedEmail({ organizationName: 'Acme', memberName: 'Grace' });
+    expect(content.subject).toBe('Grace joined Acme');
+    expect(content.html).toContain('Grace');
+    expect(content.text).toContain('Acme');
+  });
+
+  it('renders the issue assigned email', async () => {
+    const content = await issueAssignedEmail({
+      issueIdentifier: 'ORB-42',
+      issueTitle: 'Fix the flux capacitor',
+      assignerName: 'Ada',
+      url: 'https://tack.local/issue/ORB-42',
+    });
+    expect(content.subject).toBe('ORB-42 Fix the flux capacitor');
+    expect(content.html).toContain('https://tack.local/issue/ORB-42');
+    expect(content.text).toContain('ORB-42');
+  });
+
+  it('renders the mention email and escapes user content', async () => {
+    const content = await mentionEmail({
+      actorName: 'Ada',
+      context: 'ORB-42',
+      excerpt: '<script>alert(1)</script> & "quoted"',
+      url: 'https://tack.local/issue/ORB-42#c1',
+    });
+    expect(content.html).not.toContain('<script>');
+    expect(content.html).toContain('&lt;script&gt;');
+    expect(content.html).toContain('https://tack.local/issue/ORB-42#c1');
+  });
+
+  it('renders the comment email', async () => {
+    const content = await commentEmail({
+      actorName: 'Grace',
+      issueIdentifier: 'ORB-7',
+      issueTitle: 'Ship it',
+      excerpt: 'Looks good to me',
+      url: 'https://tack.local/issue/ORB-7',
+    });
+    expect(content.subject).toBe('Grace commented on ORB-7');
+    expect(content.html).toContain('Looks good to me');
+    expect(content.text).toContain('https://tack.local/issue/ORB-7');
+  });
+
+  it('renders the digest email with every section and item', async () => {
+    const content = await digestEmail({
+      organizationName: 'Acme',
+      period: 'Week of 20 July',
+      sections: [
+        {
+          title: 'Completed',
+          items: [
+            { title: 'ORB-1 Land the router', url: 'https://tack.local/issue/ORB-1', meta: '2d' },
+          ],
+        },
+        {
+          title: 'In progress',
+          items: [{ title: 'ORB-2 Realtime deltas', url: 'https://tack.local/issue/ORB-2' }],
+        },
+      ],
+    });
+    expect(content.subject).toBe('Acme digest: Week of 20 July');
+    expect(content.html).toContain('https://tack.local/issue/ORB-1');
+    expect(content.html).toContain('https://tack.local/issue/ORB-2');
+    expect(content.text).toContain('COMPLETED');
+    expect(content.text).toContain('IN PROGRESS');
+  });
+});
+
+describe('createEmailTransport', () => {
+  it('builds a resend transport from the api key', () => {
+    expect(createEmailTransport({ RESEND_API_KEY: 're_test_key' })).toBeInstanceOf(ResendTransport);
+  });
+
+  it('accepts a custom from address', () => {
+    expect(
+      createEmailTransport({ RESEND_API_KEY: 're_test_key', EMAIL_FROM: 'Tack <hi@tack.dev>' }),
+    ).toBeInstanceOf(ResendTransport);
+  });
+
+  it('refuses to build without an api key', () => {
+    expect(() => createEmailTransport({})).toThrow(DomainError);
+  });
+
+  it('treats a blank api key as unset', () => {
+    expect(() => createEmailTransport({ RESEND_API_KEY: '   ' })).toThrow(DomainError);
+  });
+
+  it('refuses a blank key passed straight to the transport', () => {
+    expect(() => new ResendTransport('')).toThrow(DomainError);
+  });
+});
+
+describe('sendEmail idempotency', () => {
+  it('sends once and records the delivery', async () => {
+    await withRollback(async (tx) => {
+      const transport = new RecordingTransport();
+      const key = `test_${randomUUIDv7()}`;
+      const record = await sendEmail(
+        tx,
+        {
+          to: 'ada@tack.local',
+          subject: 'Hello',
+          html: '<p>Hello</p>',
+          text: 'Hello',
+          idempotencyKey: key,
+          template: 'sign-in-code',
+        },
+        transport,
+      );
+      expect(transport.sent).toHaveLength(1);
+      expect(record.status).toBe('sent');
+      expect(record.providerId).toBe('prov_1');
+      expect(record.sentAt).not.toBeNull();
+      expect(record.template).toBe('sign-in-code');
+    });
+  });
+
+  it('is a no-op for a repeated idempotency key and returns the original record', async () => {
+    await withRollback(async (tx) => {
+      const transport = new RecordingTransport();
+      const key = `test_${randomUUIDv7()}`;
+      const message = {
+        to: 'ada@tack.local',
+        subject: 'Hello',
+        html: '<p>Hello</p>',
+        text: 'Hello',
+        idempotencyKey: key,
+        template: 'sign-in-code',
+      };
+      const first = await sendEmail(tx, message, transport);
+      const second = await sendEmail(tx, { ...message, subject: 'Different' }, transport);
+      expect(transport.sent).toHaveLength(1);
+      expect(second.id).toBe(first.id);
+      expect(second.subject).toBe('Hello');
+
+      const rows = await tx
+        .select()
+        .from(emailDelivery)
+        .where(eq(emailDelivery.idempotencyKey, key));
+      expect(rows).toHaveLength(1);
+    });
+  });
+
+  it('records a failure and rethrows a domain error', async () => {
+    await withRollback(async (tx) => {
+      const key = `test_${randomUUIDv7()}`;
+      const transport = new RecordingTransport(new Error('resend exploded'));
+      await expect(
+        sendEmail(
+          tx,
+          {
+            to: 'ada@tack.local',
+            subject: 'Hello',
+            html: '<p>Hello</p>',
+            text: 'Hello',
+            idempotencyKey: key,
+            template: 'sign-in-code',
+          },
+          transport,
+        ),
+      ).rejects.toThrow(DomainError);
+
+      const rows = await tx
+        .select()
+        .from(emailDelivery)
+        .where(eq(emailDelivery.idempotencyKey, key));
+      expect(rows[0]?.status).toBe('failed');
+      expect(rows[0]?.error).toBe('resend exploded');
+    });
+  });
+
+  it('rejects an invalid message', async () => {
+    await withRollback(async (tx) => {
+      await expect(
+        sendEmail(
+          tx,
+          {
+            to: 'not-an-email',
+            subject: 'Hello',
+            html: '<p>Hello</p>',
+            text: 'Hello',
+            idempotencyKey: 'k',
+            template: 'sign-in-code',
+          },
+          new RecordingTransport(),
+        ),
+      ).rejects.toThrow();
+    });
+  });
+});

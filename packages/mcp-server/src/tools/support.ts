@@ -1,0 +1,104 @@
+import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
+import { publishDeltas } from '@tack/core';
+import type { DomainError } from '@tack/shared/errors';
+import { toDomainError, validationFailed } from '@tack/shared/errors';
+import type { SyncAction } from '@tack/shared/events';
+import { z } from 'zod';
+import { errorFields, logger } from '../logger.ts';
+
+export type ToolPayload = Record<string, unknown>;
+
+export function ok(payload: ToolPayload): CallToolResult {
+  return {
+    content: [{ type: 'text', text: JSON.stringify(payload) }],
+    structuredContent: payload,
+  };
+}
+
+function asDomainError(error: unknown): DomainError {
+  if (error instanceof z.ZodError) {
+    const detail = error.issues
+      .map((issue) => `${issue.path.join('.') || 'input'}: ${issue.message}`)
+      .join('; ');
+    return validationFailed(detail);
+  }
+  return toDomainError(error);
+}
+
+export function failed(name: string, error: unknown): CallToolResult {
+  const domain = asDomainError(error);
+  logger.warn('tool failed', { tool: name, code: domain.code, ...errorFields(error) });
+  const body =
+    domain.status >= 500
+      ? { error: { code: domain.code, message: 'Something went wrong on our side.' } }
+      : domain.toJSON();
+  return {
+    isError: true,
+    content: [{ type: 'text', text: JSON.stringify(body) }],
+  };
+}
+
+export async function publish(actions: readonly SyncAction[]): Promise<void> {
+  await publishDeltas([...actions]);
+}
+
+export interface ToolConfig<Shape extends z.ZodRawShape> {
+  readonly name: string;
+  readonly title: string;
+  readonly description: string;
+  readonly readOnly: boolean;
+  readonly destructive?: boolean;
+  readonly idempotent?: boolean;
+  readonly openWorld?: boolean;
+  readonly inputSchema: Shape;
+}
+
+export interface ToolAccess {
+  readonly reads: boolean;
+  readonly writes: boolean;
+}
+
+const DENY_EVERYTHING: ToolAccess = { reads: false, writes: false };
+
+const GRANTED = new WeakMap<McpServer, ToolAccess>();
+
+export function allowTools(server: McpServer, access: ToolAccess): void {
+  GRANTED.set(server, access);
+}
+
+function mayRegister(server: McpServer, readOnly: boolean): boolean {
+  const access = GRANTED.get(server) ?? DENY_EVERYTHING;
+  return readOnly ? access.reads : access.writes;
+}
+
+export function defineTool<Shape extends z.ZodRawShape>(
+  server: McpServer,
+  config: ToolConfig<Shape>,
+  run: (args: z.infer<z.ZodObject<Shape>>) => Promise<ToolPayload>,
+): void {
+  if (!mayRegister(server, config.readOnly)) return;
+  const inputSchema = z.strictObject(config.inputSchema) as unknown as z.ZodObject<Shape>;
+  server.registerTool<z.ZodRawShape, z.ZodObject<Shape>>(
+    config.name,
+    {
+      title: config.title,
+      description: config.description,
+      inputSchema,
+      annotations: {
+        title: config.title,
+        readOnlyHint: config.readOnly,
+        destructiveHint: config.destructive ?? false,
+        idempotentHint: config.readOnly || (config.idempotent ?? false),
+        openWorldHint: config.openWorld ?? false,
+      },
+    },
+    async (args) => {
+      try {
+        return ok(await run(args as z.infer<z.ZodObject<Shape>>));
+      } catch (error) {
+        return failed(config.name, error);
+      }
+    },
+  );
+}

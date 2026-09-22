@@ -1,0 +1,65 @@
+'use client';
+
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
+import { Tooltip } from '@/components/ui/tooltip.tsx';
+import { cn } from '@/lib/cn.ts';
+import { formatBinding } from '@/lib/keyboard/index.ts';
+import type { NavLink } from '@/lib/navigation.ts';
+
+export interface NavItemProps {
+  readonly link: NavLink;
+  readonly collapsed: boolean;
+  readonly touch: boolean;
+  readonly onNavigate: (() => void) | null;
+}
+
+export function NavItem({ link, collapsed, touch, onNavigate }: NavItemProps) {
+  const pathname = usePathname();
+  const active = pathname === link.href || pathname.startsWith(`${link.href}/`);
+  const Icon = link.icon;
+
+  const anchor = (
+    <Link
+      href={link.href}
+      aria-current={active ? 'page' : undefined}
+      {...(onNavigate === null ? {} : { onClick: onNavigate })}
+      className={cn(
+        'group flex items-center gap-2 rounded-md px-2 text-dense',
+        'transition-colors duration-[var(--duration-fast)] ease-[var(--ease-out-tack)]',
+        touch ? 'h-11 gap-3 px-3' : 'h-7 3xl:h-8',
+        active
+          ? 'bg-surface-2 font-medium text-text'
+          : 'text-muted hover:bg-surface-2/70 hover:text-text',
+        collapsed && 'justify-center px-0',
+      )}
+    >
+      <Icon className="size-4 shrink-0" strokeWidth={1.75} aria-hidden="true" />
+      {collapsed ? null : (
+        <>
+          <span className="min-w-0 flex-1 truncate">{link.label}</span>
+          {typeof link.count === 'number' && link.count > 0 ? (
+            <span
+              data-numeric
+              className="shrink-0 rounded-xs bg-surface-3 px-1 text-2xs text-muted leading-4"
+            >
+              {link.count}
+            </span>
+          ) : null}
+        </>
+      )}
+    </Link>
+  );
+
+  if (touch) return anchor;
+
+  return (
+    <Tooltip
+      label={link.label}
+      side="right"
+      {...(link.binding === undefined ? {} : { shortcut: formatBinding(link.binding) })}
+    >
+      {anchor}
+    </Tooltip>
+  );
+}

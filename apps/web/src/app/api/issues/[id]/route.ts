@@ -1,0 +1,85 @@
+import {
+  deleteIssue,
+  describeActivity,
+  getIssue,
+  getParentIssue,
+  listActivityPage,
+  listIssueAttachments,
+  listIssues,
+  listSubscribers,
+  updateIssue,
+} from '@tack/core';
+import { db } from '@tack/db';
+import { renderMarkdown } from '@tack/services/markdown';
+import { issueRefSchema, paginationSchema } from '@tack/shared/validators';
+import { handle, publish, readJson, searchParamsOf } from '@/lib/api/handler.ts';
+import { attachIssueDecorations } from '@/lib/api/issues.ts';
+
+interface RouteContext {
+  readonly params: Promise<{ id: string }>;
+}
+
+const ACTIVITY_LIMIT = 50;
+const SUB_ISSUE_LIMIT = 50;
+
+export async function GET(request: Request, context: RouteContext): Promise<Response> {
+  const { id } = await context.params;
+  const query = paginationSchema.parse(searchParamsOf(request));
+  return await handle(async (principal) => {
+    const row = await getIssue(principal, id);
+    const [issue] = await attachIssueDecorations([row]);
+    const [activityPage, subPage, subscribers, parentRow] = await Promise.all([
+      listActivityPage(db, principal, row.id, {
+        oldestFirst: true,
+        limit: ACTIVITY_LIMIT,
+        cursor: query.cursor,
+      }),
+      listIssues(principal, { parentId: row.id, limit: SUB_ISSUE_LIMIT }),
+      listSubscribers(principal, row.id),
+      getParentIssue(principal, row.id),
+    ]);
+    const [parent] = parentRow === null ? [null] : await attachIssueDecorations([parentRow]);
+    return {
+      issue,
+      descriptionHtml: renderMarkdown(row.description),
+      activity: activityPage.activity.map((entry) => ({
+        ...entry,
+        summary: describeActivity(entry),
+      })),
+      activityCursor: activityPage.nextCursor,
+      subIssues: await attachIssueDecorations(subPage.issues),
+      parent: parent ?? null,
+      subscribed: subscribers.some((row) => row.userId === principal.userId),
+      attachments: (await listIssueAttachments(principal, row.id)).map((file) => ({
+        id: file.id,
+        parentType: file.parentType,
+        parentId: file.parentId,
+        fileName: file.fileName,
+        contentType: file.contentType,
+        size: file.size,
+        storageKey: file.storageKey,
+        status: 'ready',
+      })),
+    };
+  });
+}
+
+export async function PATCH(request: Request, context: RouteContext): Promise<Response> {
+  const { id } = await context.params;
+  const body = await readJson(request);
+  return await handle(async (principal) => {
+    const result = await updateIssue(principal, id, body);
+    await publish(result.actions);
+    const [issue] = await attachIssueDecorations([result.issue]);
+    return { issue };
+  });
+}
+
+export async function DELETE(_request: Request, context: RouteContext): Promise<Response> {
+  const { id } = await context.params;
+  return await handle(async (principal) => {
+    const issue = await getIssue(principal, issueRefSchema.parse(id));
+    await publish(await deleteIssue(principal, issue.id));
+    return { deleted: { id: issue.id, identifier: issue.identifier } };
+  });
+}

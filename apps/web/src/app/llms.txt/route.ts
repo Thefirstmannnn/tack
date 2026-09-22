@@ -1,0 +1,39 @@
+import { absoluteUrl, publicAppUrl } from '@/lib/env.ts';
+
+export function GET(): Response {
+  const base = publicAppUrl();
+  const body = `# Tack
+
+> Tack is a free, open source, keyboard-first task manager for teams. It covers issues, boards, sprints, projects, and docs with a rich editor. Every change syncs instantly to every open screen over WebSockets. There is no pricing, no billing, and no paid tier: the whole product is free, forever. It is licensed Apache-2.0 and can be self-hosted.
+
+## Capabilities
+
+- Issues with priorities, labels, states, and assignees, shown as fast lists or drag-and-drop boards
+- Cycles and sprints for timeboxed planning
+- Projects that group related work
+- Docs with a rich editor, living beside the issues they describe
+- Realtime sync: edits commit to Postgres, publish to Redis, and fan out over WebSockets
+- Command palette and keyboard shortcuts for every action
+- Filters and saved views shared across the team
+- GitHub integration
+- Notifications inbox
+- MCP server, so agents can read the board, file issues, and update work
+
+## Open source
+
+- Licensed Apache-2.0, sponsored by mbhatt
+- Source: https://github.com/Thefirstmannnn/tack
+- Self-hostable on Vercel with Postgres, Redis, and an S3-compatible bucket
+
+## Links
+
+- [Landing page](${base}/)
+- [Sign in](${absoluteUrl('/login')}) with Google, GitHub, a passkey, or an email code
+- [Source code](https://github.com/Thefirstmannnn/tack)
+- [Documentation](https://Thefirstmannnn.github.io/tack/)
+- [Self-hosting guide](https://Thefirstmannnn.github.io/tack/self-hosting.html)
+`;
+  return new Response(body, {
+    headers: { 'content-type': 'text/plain; charset=utf-8' },
+  });
+}

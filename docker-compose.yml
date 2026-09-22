@@ -1,0 +1,72 @@
+name: tack
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    container_name: tack-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: tack
+      POSTGRES_PASSWORD: tack
+      POSTGRES_DB: tack
+    ports:
+      - "${POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - tack-postgres:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tack -d tack"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:8-alpine
+    container_name: tack-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    volumes:
+      - tack-redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    container_name: tack-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9011"
+    environment:
+      MINIO_ROOT_USER: tackminio
+      MINIO_ROOT_PASSWORD: tackminio
+    ports:
+      - "${MINIO_PORT:-9010}:9000"
+      - "${MINIO_CONSOLE_PORT:-9011}:9011"
+    volumes:
+      - tack-minio:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  minio-bucket:
+    image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    container_name: tack-minio-bucket
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint:
+      - sh
+      - -c
+      - |
+        mc alias set tack http://minio:9000 tackminio tackminio
+        mc mb --ignore-existing tack/tack-uploads
+
+volumes:
+  tack-postgres:
+  tack-redis:
+  tack-minio:

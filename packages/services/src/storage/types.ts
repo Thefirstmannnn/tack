@@ -1,0 +1,46 @@
+export const STORAGE_KINDS = ['image', 'video', 'audio', 'pdf', 'text', 'other'] as const;
+export type StorageKind = (typeof STORAGE_KINDS)[number];
+
+export interface UploadTarget {
+  readonly key: string;
+  readonly url: string;
+  readonly method: 'PUT';
+  readonly headers: Readonly<Record<string, string>>;
+  readonly maxBytes: number;
+  readonly expiresAt: string;
+}
+
+export interface StoredObject {
+  readonly key: string;
+  readonly size: number;
+  readonly contentType: string;
+  readonly updatedAt: Date;
+}
+
+export interface DownloadOptions {
+  readonly contentType?: string;
+  readonly disposition?: string;
+}
+
+export interface StoragePrefixSummary {
+  readonly objects: number;
+  readonly bytes: number;
+  readonly versions: number;
+  readonly versionBytes: number;
+}
+
+export interface StorageDriver {
+  readonly name: 's3';
+  createUploadTarget(
+    key: string,
+    contentType: string,
+    contentLength: number,
+  ): Promise<UploadTarget>;
+  put(key: string, body: Uint8Array, contentType: string): Promise<void>;
+  getUrl(key: string, expiresInSeconds: number, options?: DownloadOptions): Promise<string>;
+  get(key: string): Promise<Uint8Array | null>;
+  delete(key: string): Promise<void>;
+  summarizePrefix(prefix: string): Promise<StoragePrefixSummary>;
+  deletePrefix(prefix: string): Promise<void>;
+  stat(key: string): Promise<StoredObject | null>;
+}

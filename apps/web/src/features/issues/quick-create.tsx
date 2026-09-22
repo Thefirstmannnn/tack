@@ -1,0 +1,615 @@
+'use client';
+
+import {
+  DEFAULT_ESTIMATE_SCALE,
+  ISSUE_REVIEWER_MAX_COUNT,
+  PRIORITIES,
+} from '@tack/shared/constants';
+
+import { sprintLabel } from '@tack/shared/utils';
+import { Box, ChevronRight, RefreshCw, Tag, Users } from 'lucide-react';
+import { type FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import { Avatar } from '@/components/ui/avatar.tsx';
+import { Button } from '@/components/ui/button.tsx';
+import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog.tsx';
+import { Input } from '@/components/ui/input.tsx';
+import { Kbd } from '@/components/ui/kbd.tsx';
+import { Switch } from '@/components/ui/switch.tsx';
+import { useToast } from '@/components/ui/toast.tsx';
+import {
+  RichTextEditor,
+  type UploadedAttachment,
+} from '@/features/docs/editor/rich-text-editor.tsx';
+import { assertUploadable, uploadAttachment } from '@/features/docs/upload.ts';
+import { messageOf } from '@/lib/query/fetcher.ts';
+import type { Cycle, Issue, Project } from '@/lib/query/schemas.ts';
+import { useDuplicateIssues } from '@/lib/query/use-duplicate-issues.ts';
+import { useCreateIssue, useUpdateIssue } from '@/lib/query/use-issues.ts';
+import { sprintOptions } from '@/lib/sprint-options.ts';
+import { DuplicateSuggestions } from './duplicate-suggestions.tsx';
+import { EstimateGlyph, estimateLabel } from './estimate-glyph.tsx';
+import {
+  attachPending,
+  holdAttachment,
+  type PendingAttachment,
+  releasePending,
+} from './pending-attachments.ts';
+import { PriorityGlyph, priorityLabel } from './priority-glyph.tsx';
+import { projectSupportsTeam } from './project-scope.ts';
+import { PropertyMenu } from './property-menu.tsx';
+import { StateGlyph } from './state-glyph.tsx';
+import { statesForTeam, useWorkspace } from './workspace-provider.tsx';
+
+export interface QuickCreateDialogProps {
+  readonly open: boolean;
+  readonly onOpenChange: (open: boolean) => void;
+  readonly defaultTeamId: string | null;
+}
+
+const chipClassName =
+  'flex h-7 items-center gap-1.5 rounded-md border border-border bg-surface px-2 text-2xs text-muted transition-colors duration-[var(--duration-fast)] hover:border-border-strong hover:text-text';
+
+function pendingLabel(count: number): string {
+  const noun = count === 1 ? 'file' : 'files';
+  return `${count} ${noun} will be attached once the issue is created.`;
+}
+
+function reviewersLabel(count: number): string {
+  if (count === 0) return 'Reviewers';
+  return `${count} reviewer${count === 1 ? '' : 's'}`;
+}
+
+function compatibleTeamId(
+  project: Project,
+  currentTeamId: string | null,
+  availableTeamIds: readonly string[],
+): string | null {
+  if (project.teamIds.length === 0) return currentTeamId;
+  if (currentTeamId !== null && project.teamIds.includes(currentTeamId)) return currentTeamId;
+  return availableTeamIds.find((teamId) => project.teamIds.includes(teamId)) ?? null;
+}
+
+function ScopePickers({
+  projects,
+  cycles,
+  projectId,
+  estimate,
+  cycleId,
+  onProject,
+  onEstimate,
+  onCycle,
+}: {
+  readonly projects: readonly Project[];
+  readonly cycles: readonly Cycle[];
+  readonly projectId: string | null;
+  readonly estimate: number | null;
+  readonly cycleId: string | null;
+  readonly onProject: (id: string | null) => void;
+  readonly onEstimate: (points: number | null) => void;
+  readonly onCycle: (id: string | null) => void;
+}) {
+  return (
+    <>
+      <PropertyMenu
+        title="Project"
+        options={[
+          {
+            id: 'none',
+            label: projects.length === 0 ? 'No projects in this workspace' : 'No project',
+            icon: <Box className="size-3.5 text-muted" aria-hidden="true" />,
+          },
+          ...projects.map((project) => ({
+            id: project.id,
+            label: project.name,
+            icon: <Box className="size-3.5 text-muted" aria-hidden="true" />,
+          })),
+        ]}
+        selected={projectId === null ? ['none'] : [projectId]}
+        onSelect={(value) => onProject(value === 'none' ? null : value)}
+      >
+        <button type="button" className={chipClassName} data-testid="quick-create-project">
+          <Box className="size-3.5" aria-hidden="true" />
+          {projects.find((project) => project.id === projectId)?.name ?? 'Project'}
+        </button>
+      </PropertyMenu>
+
+      <PropertyMenu
+        title="Estimate"
+        options={[
+          { id: 'none', label: estimateLabel(null), icon: <EstimateGlyph points={null} /> },
+          ...DEFAULT_ESTIMATE_SCALE.map((points) => ({
+            id: String(points),
+            label: estimateLabel(points),
+            icon: <EstimateGlyph points={points} />,
+          })),
+        ]}
+        selected={estimate === null ? ['none'] : [String(estimate)]}
+        onSelect={(value) => onEstimate(value === 'none' ? null : Number(value))}
+      >
+        <button type="button" className={chipClassName} data-testid="quick-create-estimate">
+          <span aria-hidden="true" className="flex items-center">
+            <EstimateGlyph points={estimate} />
+          </span>
+          {estimate === null ? 'Estimate' : estimateLabel(estimate)}
+        </button>
+      </PropertyMenu>
+
+      <PropertyMenu
+        title="Sprint"
+        options={[
+          {
+            id: 'none',
+            label: cycles.length === 0 ? 'No sprints yet' : 'No sprint',
+            icon: <RefreshCw className="size-3.5 text-muted" aria-hidden="true" />,
+          },
+          ...sprintOptions(cycles).map((cycle) => ({
+            id: cycle.id,
+            label: cycle.label,
+            icon: <RefreshCw className="size-3.5 text-muted" aria-hidden="true" />,
+          })),
+        ]}
+        selected={cycleId === null ? ['none'] : [cycleId]}
+        onSelect={(value) => onCycle(value === 'none' ? null : value)}
+      >
+        <button type="button" className={chipClassName} data-testid="quick-create-cycle">
+          <RefreshCw className="size-3.5" aria-hidden="true" />
+          {(() => {
+            const found = cycles.find((cycle) => cycle.id === cycleId);
+            return found === undefined ? 'Sprint' : sprintLabel(found);
+          })()}
+        </button>
+      </PropertyMenu>
+    </>
+  );
+}
+
+export function QuickCreateDialog({ open, onOpenChange, defaultTeamId }: QuickCreateDialogProps) {
+  const { teams, states, members, labels, projects, cycles, ready } = useWorkspace();
+  const { toast } = useToast();
+  const firstTeamId =
+    defaultTeamId !== null && teams.some((team) => team.id === defaultTeamId)
+      ? defaultTeamId
+      : (teams[0]?.id ?? null);
+  const [teamId, setTeamId] = useState<string | null>(firstTeamId);
+  const [title, setTitle] = useState('');
+  const [description, setDescription] = useState('');
+  const [stateId, setStateId] = useState<string | null>(null);
+  const [priority, setPriority] = useState(0);
+  const [assigneeId, setAssigneeId] = useState<string | null>(null);
+  const [reviewerIds, setReviewerIds] = useState<readonly string[]>([]);
+  const [labelIds, setLabelIds] = useState<readonly string[]>([]);
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const [cycleId, setCycleId] = useState<string | null>(null);
+  const [estimate, setEstimate] = useState<number | null>(null);
+  const [createMore, setCreateMore] = useState(false);
+  const [pending, setPending] = useState<readonly PendingAttachment[]>([]);
+  const [composerKey, setComposerKey] = useState(0);
+  const [dismissedDuplicates, setDismissedDuplicates] = useState(false);
+  const titleRef = useRef<HTMLInputElement>(null);
+  const submittingRef = useRef(false);
+
+  const { duplicates } = useDuplicateIssues(teamId, title);
+
+  const create = useCreateIssue(teamId ?? 'none');
+  const update = useUpdateIssue();
+
+  const defaultsRef = useRef(firstTeamId);
+  defaultsRef.current = firstTeamId;
+  const heldRef = useRef<readonly PendingAttachment[]>(pending);
+  heldRef.current = pending;
+
+  useEffect(() => {
+    if (!open) {
+      releasePending(heldRef.current);
+      setPending([]);
+      return;
+    }
+    setTeamId(defaultsRef.current);
+    setTitle('');
+    setDescription('');
+    setStateId(null);
+    setPriority(0);
+    setAssigneeId(null);
+    setReviewerIds([]);
+    setLabelIds([]);
+    setProjectId(null);
+    setEstimate(null);
+    setCycleId(null);
+    setPending([]);
+    setDismissedDuplicates(false);
+  }, [open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const selectedTeamExists = teamId !== null && teams.some((team) => team.id === teamId);
+    if (selectedTeamExists || teamId === firstTeamId) return;
+    const selectedProject = projects.find((project) => project.id === projectId);
+    setTeamId(firstTeamId);
+    setStateId(null);
+    if (firstTeamId === null || !projectSupportsTeam(selectedProject, firstTeamId))
+      setProjectId(null);
+    setEstimate(null);
+    setLabelIds([]);
+  }, [firstTeamId, open, projectId, projects, teamId, teams]);
+
+  const hold = useCallback(
+    (file: File): Promise<UploadedAttachment> => {
+      try {
+        const contentType = assertUploadable(file);
+        const entry = holdAttachment(file);
+        setPending((current) => [...current, entry]);
+        return Promise.resolve({
+          url: entry.placeholder,
+          fileName: file.name,
+          contentType,
+        });
+      } catch (error: unknown) {
+        const reason = messageOf(error);
+        toast({ title: 'Could not attach that file', description: reason, tone: 'danger' });
+        return Promise.reject(new Error(reason));
+      }
+    },
+    [toast],
+  );
+
+  const finalize = useCallback(
+    (issue: Issue, body: string, held: readonly PendingAttachment[]): void => {
+      if (held.length === 0) return;
+      const run = async (): Promise<void> => {
+        const outcome = await attachPending(
+          body,
+          held,
+          async (file) => await uploadAttachment('issue', issue.id, file),
+        );
+        releasePending(held);
+        for (const failure of outcome.failures) {
+          toast({
+            title: `Could not attach ${failure.fileName}`,
+            description: failure.reason,
+            tone: 'danger',
+          });
+        }
+        if (outcome.rewritten === 0) return;
+        await update.mutateAsync({ issue, patch: { description: outcome.description } });
+      };
+      run().catch(() => undefined);
+    },
+    [toast, update],
+  );
+
+  const teamStates = statesForTeam(states, teamId);
+  const teamLabels = labels.filter((label) => label.teamId === null || label.teamId === teamId);
+  const selectedState = teamStates.find((state) => state.id === stateId);
+  const assignee = members.find((member) => member.id === assigneeId);
+
+  useEffect(() => {
+    if (projectId === null || teamId === null) return;
+    const selectedProject = projects.find((project) => project.id === projectId);
+    if (!projectSupportsTeam(selectedProject, teamId)) setProjectId(null);
+  }, [projectId, projects, teamId]);
+
+  const selectProject = (nextProjectId: string | null) => {
+    if (nextProjectId === null) {
+      setProjectId(null);
+      return;
+    }
+    const project = projects.find((entry) => entry.id === nextProjectId);
+    if (project === undefined) return;
+    const nextTeamId = compatibleTeamId(
+      project,
+      teamId,
+      teams.map((team) => team.id),
+    );
+    if (nextTeamId === null) return;
+    if (nextTeamId !== teamId) {
+      setTeamId(nextTeamId);
+      setStateId(null);
+      setEstimate(null);
+      setLabelIds([]);
+    }
+    setProjectId(nextProjectId);
+  };
+
+  const submit = (event?: FormEvent<HTMLFormElement>) => {
+    event?.preventDefault();
+    if (submittingRef.current || create.isPending) return;
+    if (teamId === null || title.trim().length === 0) return;
+    const body = description;
+    const held = pending;
+    submittingRef.current = true;
+    setDismissedDuplicates(true);
+    create.mutate(
+      {
+        teamId,
+        title: title.trim(),
+        description: body,
+        ...(stateId === null ? {} : { stateId }),
+        priority,
+        assigneeId,
+        reviewerIds,
+        projectId,
+        cycleId,
+        estimate,
+        labelIds,
+      },
+      {
+        onError: () => {
+          submittingRef.current = false;
+        },
+        onSuccess: (issue) => {
+          submittingRef.current = false;
+          setPending((current) => current.filter((entry) => !held.includes(entry)));
+          finalize(issue, body, held);
+          if (!createMore) {
+            onOpenChange(false);
+            return;
+          }
+          setTitle('');
+          setDescription('');
+          setLabelIds([]);
+          setComposerKey((value) => value + 1);
+          titleRef.current?.focus();
+        },
+      },
+    );
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={onOpenChange}>
+      <DialogContent
+        data-testid="quick-create"
+        className="flex max-w-xl flex-col overflow-y-hidden"
+      >
+        <DialogTitle className="sr-only">Create issue</DialogTitle>
+        <p
+          className="flex shrink-0 items-center gap-1.5 text-2xs text-faint"
+          data-testid="quick-create-crumb"
+        >
+          <span className="rounded-sm bg-surface-2 px-1.5 py-0.5 text-text">
+            {teams.find((team) => team.id === teamId)?.key ?? 'Team'}
+          </span>
+          <ChevronRight className="size-3" aria-hidden="true" />
+          New issue
+        </p>
+        <form
+          onSubmit={submit}
+          onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
+            if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+              event.preventDefault();
+              submit();
+            }
+          }}
+          className="flex min-h-0 flex-1 flex-col gap-3 pt-1.5"
+        >
+          <div
+            className="-mx-1 flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-1"
+            data-testid="quick-create-scroll"
+          >
+            <Input
+              ref={titleRef}
+              autoFocus
+              data-testid="quick-create-title"
+              placeholder="Issue title"
+              value={title}
+              onChange={(event) => {
+                setTitle(event.target.value);
+                setDismissedDuplicates(false);
+              }}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing) return;
+                if (event.key === 'Enter' && !event.metaKey && !event.ctrlKey)
+                  event.preventDefault();
+              }}
+              className="h-9 shrink-0 border-0 px-0 font-medium text-base shadow-none"
+            />
+            {!dismissedDuplicates && duplicates.length > 0 ? (
+              <DuplicateSuggestions
+                duplicates={duplicates}
+                onDismiss={() => setDismissedDuplicates(true)}
+              />
+            ) : null}
+            <RichTextEditor
+              key={composerKey}
+              className="shrink-0"
+              value={description}
+              onChange={setDescription}
+              members={members}
+              placeholder="Add a description, markdown works."
+              ariaLabel="Issue description"
+              testId="quick-create-description"
+              onUpload={hold}
+            />
+            {pending.length === 0 ? null : (
+              <output className="shrink-0 text-2xs text-faint" data-testid="quick-create-pending">
+                {pendingLabel(pending.length)}
+              </output>
+            )}
+
+            <div
+              className="flex shrink-0 flex-wrap items-center gap-1.5"
+              data-testid="quick-create-properties"
+            >
+              <PropertyMenu
+                title="Team"
+                options={teams.map((team) => ({ id: team.id, label: team.name }))}
+                selected={teamId === null ? [] : [teamId]}
+                onSelect={(id) => {
+                  const selectedProject = projects.find((project) => project.id === projectId);
+                  setTeamId(id);
+                  setStateId(null);
+                  if (!projectSupportsTeam(selectedProject, id)) setProjectId(null);
+                  setEstimate(null);
+                  setLabelIds([]);
+                }}
+              >
+                <button type="button" className={chipClassName} data-testid="quick-create-team">
+                  {teams.find((team) => team.id === teamId)?.key ?? 'Team'}
+                </button>
+              </PropertyMenu>
+
+              <PropertyMenu
+                title="Status"
+                options={teamStates.map((state) => ({
+                  id: state.id,
+                  label: state.name,
+                  icon: <StateGlyph category={state.category} color={state.color} />,
+                }))}
+                selected={stateId === null ? [] : [stateId]}
+                onSelect={setStateId}
+              >
+                <button type="button" className={chipClassName} data-testid="quick-create-status">
+                  <span aria-hidden="true" className="flex items-center">
+                    {selectedState === undefined ? (
+                      <span className="size-3.5 rounded-full border border-border border-dashed" />
+                    ) : (
+                      <StateGlyph category={selectedState.category} color={selectedState.color} />
+                    )}
+                  </span>
+                  {selectedState?.name ?? 'Status'}
+                </button>
+              </PropertyMenu>
+
+              <PropertyMenu
+                title="Priority"
+                options={PRIORITIES.map((value) => ({
+                  id: String(value),
+                  label: priorityLabel(value),
+                  icon: <PriorityGlyph priority={value} />,
+                }))}
+                selected={[String(priority)]}
+                onSelect={(value) => setPriority(Number(value))}
+              >
+                <button type="button" className={chipClassName}>
+                  <PriorityGlyph priority={priority} />
+                  {priorityLabel(priority)}
+                </button>
+              </PropertyMenu>
+
+              <PropertyMenu
+                title="Assignee"
+                options={[
+                  { id: 'none', label: 'No assignee' },
+                  ...members.map((member) => ({
+                    id: member.id,
+                    label: member.name,
+                    icon: <Avatar name={member.name} src={member.image} size="xs" />,
+                  })),
+                ]}
+                selected={assigneeId === null ? ['none'] : [assigneeId]}
+                onSelect={(value) => setAssigneeId(value === 'none' ? null : value)}
+              >
+                <button type="button" className={chipClassName} data-testid="quick-create-assignee">
+                  <span aria-hidden="true" className="flex items-center">
+                    {assignee === undefined ? (
+                      <span className="size-3.5 rounded-full border border-border border-dashed" />
+                    ) : (
+                      <Avatar name={assignee.name} src={assignee.image} size="xs" />
+                    )}
+                  </span>
+                  {assignee?.name ?? 'Assignee'}
+                </button>
+              </PropertyMenu>
+
+              <PropertyMenu
+                title="Reviewers"
+                multiple
+                options={members.map((member) => ({
+                  id: member.id,
+                  label: member.name,
+                  icon: <Avatar name={member.name} src={member.image} size="xs" />,
+                  disabled:
+                    reviewerIds.length >= ISSUE_REVIEWER_MAX_COUNT &&
+                    !reviewerIds.includes(member.id),
+                }))}
+                selected={reviewerIds}
+                onSelect={(id) =>
+                  setReviewerIds((current) => {
+                    if (current.includes(id)) {
+                      return current.filter((entry) => entry !== id);
+                    }
+                    if (current.length >= ISSUE_REVIEWER_MAX_COUNT) return current;
+                    return [...current, id];
+                  })
+                }
+              >
+                <button
+                  type="button"
+                  className={chipClassName}
+                  data-testid="quick-create-reviewers"
+                >
+                  <Users className="size-3.5" aria-hidden="true" />
+                  {reviewersLabel(reviewerIds.length)}
+                </button>
+              </PropertyMenu>
+
+              <PropertyMenu
+                title="Labels"
+                multiple
+                options={teamLabels.map((label) => ({
+                  id: label.id,
+                  label: label.name,
+                  icon: (
+                    <span
+                      className="size-2 rounded-full"
+                      style={{ backgroundColor: label.color }}
+                      aria-hidden="true"
+                    />
+                  ),
+                }))}
+                selected={labelIds}
+                onSelect={(id) =>
+                  setLabelIds((current) =>
+                    current.includes(id)
+                      ? current.filter((entry) => entry !== id)
+                      : [...current, id],
+                  )
+                }
+              >
+                <button type="button" className={chipClassName} data-testid="quick-create-labels">
+                  <Tag className="size-3.5" aria-hidden="true" />
+                  {labelIds.length === 0 ? 'Labels' : `${labelIds.length} labels`}
+                </button>
+              </PropertyMenu>
+
+              <ScopePickers
+                projects={projects}
+                cycles={cycles}
+                projectId={projectId}
+                estimate={estimate}
+                cycleId={cycleId}
+                onProject={selectProject}
+                onEstimate={setEstimate}
+                onCycle={setCycleId}
+              />
+            </div>
+          </div>
+
+          <div className="flex shrink-0 items-center justify-end gap-2 border-border border-t pt-3">
+            <span className="mr-auto flex items-center gap-1 text-2xs text-faint">
+              <Kbd keys={['mod', 'enter']} /> to create
+            </span>
+            <span className="flex items-center gap-2 text-2xs text-muted">
+              <Switch
+                checked={createMore}
+                onCheckedChange={setCreateMore}
+                aria-label="Create more"
+                data-testid="quick-create-more"
+              />
+              Create more
+            </span>
+            <Button
+              type="submit"
+              size="sm"
+              variant="primary"
+              data-testid="quick-create-submit"
+              disabled={!ready || title.trim().length === 0 || create.isPending}
+            >
+              Create issue
+            </Button>
+          </div>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}

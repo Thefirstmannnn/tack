@@ -1,0 +1,294 @@
+# Concepts
+
+The vocabulary Tack uses, and what each thing is actually for. If you have used
+any other issue tracker most of this will be familiar, and the places where
+Tack differs are called out.
+
+## Workspace
+
+The top level container. A workspace has members, teams, projects, docs, labels
+and settings, and nothing crosses between workspaces.
+
+One workspace per company is the normal setup. You can belong to several and
+switch between them from the top left, and each keeps its own everything.
+
+A workspace can restrict which email domains may join, on top of the
+server-level `ALLOWED_EMAIL_DOMAINS`.
+
+## Members and roles
+
+Everyone in a workspace has one of four roles. Permissions are cumulative, so
+each role can do everything the one below it can.
+
+| Role | Can do |
+| --- | --- |
+| **Guest** | Read issues, projects and docs. Comment, react |
+| **Contributor** | Everything a guest can, plus create and update issues, upload attachments, manage their own views |
+| **Member** | Everything a contributor can, plus delete issues, delete anyone's comments, manage projects, cycles, milestones, labels, workflows, and write and publish docs |
+| **Admin** | Everything, plus invite and manage members, manage integrations and manage the workspace |
+
+Every authorization decision goes through `packages/shared/src/policy`, which is
+one file that both the server and the UI read. The server enforces it. The UI
+uses it to hide buttons you cannot use, never as the only gate.
+
+Guests are the useful one to understand: a contractor or a stakeholder can be in
+the workspace, read the board and comment, without being able to change work.
+
+> **Analytics Visibility Rule:** Analytics totals and aggregate charts span the entire workspace for every role (including guests and contributors) to prevent misleading partial dashboards. Issue-level drilldown rows follow team membership and report a withheld count. The longest cycle time list ranks the workspace candidates first, then removes rows outside the reader's team scope and reports how many ranked candidates were withheld.
+
+## Teams
+
+Teams are how work is divided, and they own the parts of Tack that need a
+boundary. Each team has:
+
+- A **key**, two to five letters, which prefixes every issue identifier. The
+  Engineering team's issues are `ENG-1`, `ENG-2` and so on.
+- Its own **workflow states**.
+- Its own **sprints and cycles**.
+- Its own **board and issue list**.
+
+The demo workspace seeds Engineering (`ENG`), Design (`DES`) and Marketing
+(`MKT`).
+
+Teams also decide realtime delivery. A project and its milestones carry the
+scopes of the teams that own them, so a change is only pushed to people entitled
+to see it.
+
+## Issues
+
+The unit of work. An issue has a title, a markdown description, a state, a
+priority, an assignee, multiple reviewers, labels, an estimate, and relations
+to other issues. Reviewers are subscribed automatically, and reviewed work
+appears in their My issues page alongside work assigned to them.
+
+Its **identifier** is the team key plus a number, like `ENG-42`. Identifiers are
+allocated atomically, so two people creating issues at the same moment never
+collide. Type an identifier in the command palette to jump straight to it.
+
+### States
+
+Each state belongs to a category, and the category drives the board columns,
+progress and analytics.
+
+| Category | Meaning |
+| --- | --- |
+| Triage | Arrived, not yet decided on |
+| Backlog | Decided, not scheduled |
+| Todo | Scheduled, not started |
+| In Progress | Being worked on |
+| In Review | Waiting on review |
+| Done | Finished |
+| Canceled | Deliberately not doing it |
+
+Teams can rename states and add their own, but every state maps to one of these
+categories, which is what keeps analytics comparable across teams.
+
+### Priority
+
+Urgent, High, Medium, Low, or none. Sorting by priority puts unset last, on the
+grounds that an unprioritised issue is not urgent.
+
+### Relations
+
+Issues can block, be blocked by, relate to, or duplicate each other. Blocking is
+the one that changes behaviour: an issue blocked by another is flagged wherever
+it appears, so the block is visible before anyone plans around it.
+
+### Duplicate detection
+
+When drafting a new issue, Tack runs trigram similarity across existing issues
+in the same team. If similar issues already exist, up to four non-blocking
+suggestions appear beneath the title field with their current workflow state,
+allowing quick review before creating a duplicate.
+
+### Estimates
+
+Points, on the usual scale. Optional. Sprints can track scope by issue count or
+by points, and analytics shows both.
+
+## Labels
+
+Tags with a colour. A label is workspace wide by default, which is what makes it
+useful for things like `Bug`, `Performance` or `Docs`, and they are the main
+thing filters and saved views are built from.
+
+A label can instead be pinned to one team. A team label is only visible to that
+team, only pushed over realtime to that team, and only attachable to that team's
+issues. Pinning a workspace label to a team also takes it off the issues of every
+other team, so the rule holds for issues that already carried it rather than only
+for the next edit. Widening a team label back to the workspace touches no issue.
+Carrying an issue to another team works the same way round: the labels the new
+team cannot use come off it as it lands, and the workspace-wide ones stay.
+Manage both under **Settings**, **Labels**.
+
+Two labels may share a name when they live in different places, a workspace
+`Regression` alongside a team `Regression`. The API and the settings screen take
+ids, so that is unambiguous, but a name given to an MCP tool is not: when more
+than one label answers to it, the tool refuses and lists the ids rather than
+picking one.
+
+## Workflow states
+
+The columns of a team board. Each one belongs to a single team, carries a
+position that fixes its place in the order, and carries a **category**, one of
+`triage`, `backlog`, `unstarted`, `started`, `review`, `completed` or `canceled`.
+
+The category is the part the rest of Tack reads. It is what decides whether an
+issue counts as open on a sprint burndown, when `startedAt` and `completedAt`
+are stamped, and which bucket the standup board puts it in. Renaming a status or
+moving it in the order leaves the category alone; changing the category re-dates
+every issue sitting in that status, on the server, in the same transaction. Those
+issues did not move, so how long they have sat where they are is left alone.
+
+Deleting a status that still holds issues is refused until you name the status
+those issues move to, and a team always keeps at least one status. Manage them
+under **Settings**, **Workflow**.
+
+## Sprints and cycles
+
+Timeboxed periods of work belonging to a team. A sprint has a start date, an end
+date, a set of issues, and a scope measured in issues or points.
+
+Tack uses **sprint** and **cycle** for the same underlying thing. Cycles are
+the continuous, always-one-running flavour, sprints the named, planned flavour,
+and both are the same object.
+
+What a sprint gives you:
+
+- **Scope**, and how it changed after the sprint started.
+- **Burndown** of remaining work against time.
+- **Carryover**, meaning what did not finish when you complete the sprint.
+
+### Lead time and cycle time
+
+The sprint analytics flow-time card summarizes completed issues associated with
+the selected sprint. It shows the median (`p50`) and the 85th percentile (`p85`)
+in calendar days. Unfinished and canceled issues do not contribute a duration.
+
+- **Lead time** runs from the issue's creation time to its durable completion
+  time. It starts at creation even when the issue joined the sprint later.
+- **Cycle time** runs from the issue's `startedAt` time to its durable completion
+  time. Tack omits an issue from this calculation when it has no start time.
+
+Tack also omits either duration when its end is earlier than its start. If no
+valid durations remain, the corresponding metric is unavailable.
+
+Lead time uses the creation timestamp from the current issue row. Cycle time
+uses the current mutable `startedAt` column. For an active sprint, Tack labels
+that cycle-time coverage `current-column`. For a completed sprint, it labels the
+coverage `reconstructed-current-column` because close outcomes preserve the
+completion time but not the first start time. Editing `startedAt` later can
+therefore change a completed sprint's historical cycle-time distribution.
+
+Completing a sprint asks what to do with unfinished issues: move them to the
+next sprint, or back to the backlog.
+
+## Projects and milestones
+
+Projects group related work that does not fit inside one team or one sprint.
+"Realtime Sync Engine" is a project; it has issues from Engineering and Design,
+runs across several sprints, and has a lead, a target date and a status.
+
+**Milestones** divide a project into stages, so progress is measured against
+something real rather than a percentage of a moving total.
+
+**Health and updates** track qualitative project status over time. An update
+captures a health category, markdown notes, the author, and a timestamp:
+
+- **On track** (`on_track`): The project is progressing according to schedule.
+- **At risk** (`at_risk`): Blockers, dependency delays, or capacity risks exist.
+- **Off track** (`off_track`): Key milestones or target dates will be missed without intervention.
+- **No update** (`no_update`): The initial state before a lead posts the first update.
+
+The workspace feed on the Projects page surfaces the latest update from every
+visible project in a single stream, giving leads and stakeholders visibility
+across the workspace without having to inspect each project individually.
+
+The difference from sprints in one line: a sprint is a period of time, a project
+is a body of work. An issue is usually in both.
+
+## Docs
+
+Markdown documents with a rich editor, or a self-contained HTML page, living
+beside the issues they describe rather than in a separate tool.
+
+- Organised into **collections**, and nestable.
+- **Visibility** is workspace-wide, private to named people, or a published URL.
+- **Shareable** through a members link that still requires sign-in, or a public
+  or unlisted link for people outside the workspace. An HTML page gets its own
+  URL and runs isolated from the app.
+- Commentable, and searchable alongside issues from the command palette.
+- Optionally bound to a path in a repository, so a doc can mirror a file.
+- A fenced `mermaid` block is drawn as a diagram, in the theme's own colours,
+  with the source one click away. The rich editor previews it as you type.
+- Import a `.md` or `.html` file. HTML stays as one file, not a project.
+
+Specs, runbooks, meeting notes and architecture decisions are the things that
+end up here.
+
+## Standup
+
+A Kanban board of the whole workspace. The toolbar has three controls, from left to right:
+
+- **AI only** includes work created by, assigned to, reviewed by, commented on, reacted to, or changed by a member marked as an AI agent. Workspace admins set **Member type** to **AI agent** or **Human** in member settings. This classification is specific to the workspace and does not change permissions.
+- **All work / To review / Assigned** chooses assignments and reviews together, reviewer tasks, or assignments alone. It applies to the member selected in the next control. Pick your name, marked **(You)**, to see your own work. With **All Members**, it includes work for everyone.
+- **All Members** opens the full member list with workload counts. Pick a person to switch immediately, or choose **All Members** to return to the workspace. Unassigned work is available when present.
+
+Hold **Option** and press **Tab** to switch forward, or **Shift+Tab** to switch backward. The member dropdown opens as you switch and closes when you release Option. The shortcuts wrap through the available choices. Filters stay in the URL when you reload or share the view.
+
+Counts and filters are calculated by the server across all matching tasks, including tasks beyond the first page. The AI filter combines with the work type, member selection, and standard issue filters. Deleted comments do not count as involvement; recorded issue activity remains part of the history.
+
+## Views and filters
+
+A **filter** narrows what you are looking at: team, state, assignee, label,
+project, sprint, priority, estimate, dates, and combinations of those.
+
+A **saved view** is a filter you named and kept. Views are shared with the
+workspace or private to you, and a private view is delivered to its owner alone
+over the realtime stream.
+
+Views are the thing to reach for when you keep re-applying the same three
+filters. `Bugs in progress with no assignee` deserves to be a view.
+
+## Inbox and notifications
+
+The inbox collects what happened that involves you: assignments, mentions,
+comments on issues you follow, state changes on work you are watching.
+
+It opens on **Activity**, which is everything people did: comments, replies,
+mentions, reactions, reviews, failed checks, document changes. Issue field moves
+such as `ENG-3 moved to In Progress` and assignments live on the **Status** tab
+instead, so a busy board cannot bury a comment. The two tabs are complements, so
+nothing is hidden, and Unread, Mentions and Pull requests still span both.
+
+In-app notification preferences are per event type, with quiet hours that
+respect your timezone.
+
+With conversation reads enabled, each pull request has one inbox row with its
+comments, reviews, lifecycle updates and current-head check failures in the
+history. Documents similarly group comments, replies, mentions and changes.
+Issue activity and issue field changes remain two separate conversations.
+Unread badges count conversations, not individual events. New activity clears
+a snooze or dismissal; marking a conversation read covers its existing events.
+
+See [Inbox conversations](features/inbox.md) for delivery behavior and rollout.
+
+## Realtime
+
+Everything above is live. When someone changes something, the change writes to
+Postgres, publishes to Redis, and fans out over a websocket to everyone whose
+scope entitles them to see it. No refresh, no polling.
+
+The delivery scope matches the read permission, so a private view goes to its
+owner alone, and a project belonging to a team goes to that team. If you can see
+it, you get it live. If you cannot, it never reaches your browser.
+
+[Architecture](architecture.md) has the mechanism.
+
+## Keyboard first
+
+Tack assumes you would rather not use the mouse. <kbd>Cmd</kbd> <kbd>K</kbd>
+opens the command palette, `g` then a letter navigates, and single keys act on
+what is selected. Press <kbd>?</kbd> for the list.
+
+[Keyboard shortcuts](keyboard-shortcuts.md) has all of them.

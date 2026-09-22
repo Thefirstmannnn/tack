@@ -1,0 +1,302 @@
+import { describe, expect, it, mock } from 'bun:test';
+import userEvent from '@testing-library/user-event';
+import type { GroupContext } from '@/features/filters/grouping.ts';
+import { groupIssues } from '@/features/filters/grouping.ts';
+import type { Issue, Member, WorkflowState } from '@/lib/query/schemas.ts';
+import { fireEvent, render, screen } from '@/test/render.tsx';
+import { buildRows } from '../../../src/features/issues/issue-list.tsx';
+import { IssueRow } from '../../../src/features/issues/issue-row.tsx';
+
+function issue(overrides: Partial<Issue> = {}): Issue {
+  return {
+    id: 'issue_1',
+    organizationId: 'org_1',
+    teamId: 'team_1',
+    number: 7,
+    identifier: 'ENG-7',
+    title: 'Domain auto join for verified workspace domains',
+    description: '',
+    stateId: 'state_todo',
+    priority: 3,
+    creatorId: 'user_1',
+    assigneeId: null,
+    projectId: null,
+    milestoneId: null,
+    cycleId: null,
+    parentId: null,
+    estimate: null,
+    dueDate: null,
+    sortOrder: 1024,
+    startedAt: null,
+    completedAt: null,
+    canceledAt: null,
+    stateEnteredAt: '2026-01-01T00:00:00.000Z',
+    syncId: 1,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    archivedAt: null,
+    labelIds: [],
+    ...overrides,
+  };
+}
+
+const todo: WorkflowState = {
+  id: 'state_todo',
+  teamId: 'team_1',
+  name: 'Todo',
+  category: 'unstarted',
+  color: '#5d6272',
+  position: 2,
+};
+const reviewers: readonly Member[] = [
+  {
+    id: 'reviewer_1',
+    name: 'Ada Reviewer',
+    email: 'ada@tack.test',
+    image: '/ada.png',
+    handle: 'ada',
+    role: 'member',
+  },
+  {
+    id: 'reviewer_2',
+    name: 'Bo Reviewer',
+    email: 'bo@tack.test',
+    image: '/bo.png',
+    handle: 'bo',
+    role: 'member',
+  },
+];
+
+const done: WorkflowState = {
+  id: 'state_done',
+  teamId: 'team_1',
+  name: 'Done',
+  category: 'completed',
+  color: '#2e9e68',
+  position: 5,
+};
+
+const groupContext: GroupContext = {
+  states: [todo, done],
+  members: [
+    {
+      id: 'user_2',
+      name: 'Aditi Rao',
+      email: 'aditi@YOUR_DOMAIN',
+      image: null,
+      handle: 'aditi',
+      role: 'member',
+    },
+  ],
+  projects: [],
+  cycles: [],
+  labels: [],
+};
+
+describe('IssueRow', () => {
+  it('opens on click and toggles selection from the checkbox', async () => {
+    const user = userEvent.setup();
+    const onOpen = mock();
+    const onToggleSelected = mock();
+
+    render(
+      <IssueRow
+        issue={issue()}
+        state={todo}
+        labels={[]}
+        assignee={undefined}
+        active={false}
+        selected={false}
+        onOpen={onOpen}
+        onToggleSelected={onToggleSelected}
+        onFocus={mock()}
+      />,
+    );
+
+    await user.click(screen.getByText('Domain auto join for verified workspace domains'));
+    expect(onOpen).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByLabelText('Select ENG-7'));
+    expect(onToggleSelected).toHaveBeenCalledTimes(1);
+  });
+
+  it('reveals the checkbox on hover and preserves the row-local tab order', async () => {
+    const user = userEvent.setup();
+    render(
+      <>
+        {/* biome-ignore lint/a11y/noNoninteractiveTabindex: Match Radix focus guard markup */}
+        <span data-radix-focus-guard="" tabIndex={0} />
+      </>,
+    );
+    render(
+      <>
+        <button data-testid="issue-row-focus-start" type="button" />
+        <IssueRow
+          issue={issue()}
+          state={todo}
+          labels={[]}
+          assignee={undefined}
+          active={false}
+          selected={false}
+          onOpen={mock()}
+          onToggleSelected={mock()}
+          onFocus={mock()}
+        />
+      </>,
+    );
+
+    const checkbox = screen.getByLabelText('Select ENG-7');
+    expect(checkbox.className).toContain('opacity-0');
+    expect(checkbox.className).toContain('group-hover:opacity-100');
+    expect(checkbox.className).toContain('focus-visible:opacity-100');
+
+    const focusStart = screen.getByTestId('issue-row-focus-start');
+    focusStart.focus();
+    expect(focusStart).toHaveFocus();
+    await user.tab();
+    expect(checkbox).toHaveFocus();
+  });
+
+  it('carries the issue title on a real link to the issue page', () => {
+    render(
+      <IssueRow
+        issue={issue()}
+        state={todo}
+        labels={[]}
+        assignee={undefined}
+        active={false}
+        selected={false}
+        onOpen={mock()}
+        onToggleSelected={mock()}
+        onFocus={mock()}
+      />,
+    );
+
+    const link = screen.getByRole('link', {
+      name: 'Domain auto join for verified workspace domains',
+    });
+    expect(link.tagName).toBe('A');
+    expect(link).toHaveAttribute('href', '/issue/ENG-7');
+  });
+
+  it('leaves a modified click to the browser instead of peeking', () => {
+    const onOpen = mock();
+    render(
+      <IssueRow
+        issue={issue()}
+        state={todo}
+        labels={[]}
+        assignee={undefined}
+        active={false}
+        selected={false}
+        onOpen={onOpen}
+        onToggleSelected={mock()}
+        onFocus={mock()}
+      />,
+    );
+
+    const link = screen.getByRole('link', {
+      name: 'Domain auto join for verified workspace domains',
+    });
+    fireEvent.click(link, { metaKey: true });
+    expect(onOpen).not.toHaveBeenCalled();
+
+    fireEvent.click(link);
+    expect(onOpen).toHaveBeenCalledTimes(1);
+  });
+
+  it('shows every reviewer avatar', () => {
+    render(
+      <IssueRow
+        issue={issue({ reviewerIds: reviewers.map((reviewer) => reviewer.id) })}
+        state={todo}
+        labels={[]}
+        assignee={undefined}
+        reviewers={reviewers}
+        active={false}
+        selected={false}
+        onOpen={mock()}
+        onToggleSelected={mock()}
+        onFocus={mock()}
+      />,
+    );
+
+    expect(screen.getByTitle('Reviewers: Ada Reviewer, Bo Reviewer')).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'Ada Reviewer' })).toBeInTheDocument();
+    expect(screen.getByRole('img', { name: 'Bo Reviewer' })).toBeInTheDocument();
+  });
+
+  it('marks the active row', () => {
+    render(
+      <IssueRow
+        issue={issue()}
+        state={todo}
+        labels={[]}
+        assignee={undefined}
+        active
+        selected={false}
+        onOpen={mock()}
+        onToggleSelected={mock()}
+        onFocus={mock()}
+      />,
+    );
+    expect(screen.getByTestId('issue-row-ENG-7')).toHaveAttribute('data-active', 'true');
+  });
+});
+
+describe('buildRows', () => {
+  const stateById = new Map([
+    [todo.id, todo],
+    [done.id, done],
+  ]);
+
+  function rowsFor(issues: Issue[]) {
+    return buildRows(
+      groupIssues(issues, 'state', groupContext, { showEmptyGroups: false, ordering: 'manual' }),
+      stateById,
+    );
+  }
+
+  it('emits a header per non empty group followed by its issues', () => {
+    const rows = rowsFor([
+      issue({ id: 'a', identifier: 'ENG-1', sortOrder: 2048 }),
+      issue({ id: 'b', identifier: 'ENG-2', sortOrder: 1024 }),
+      issue({ id: 'c', identifier: 'ENG-3', stateId: 'state_done' }),
+    ]);
+
+    expect(rows.map((row) => row.kind)).toEqual(['header', 'issue', 'issue', 'header', 'issue']);
+    expect(rows[0]?.kind === 'header' ? rows[0].group.issues.length : 0).toBe(2);
+    expect(rows[1]?.kind === 'issue' ? rows[1].issue.identifier : '').toBe('ENG-2');
+  });
+
+  it('skips groups with no issues', () => {
+    expect(rowsFor([issue()])).toHaveLength(2);
+  });
+
+  it('keeps empty groups when asked to', () => {
+    const rows = buildRows(
+      groupIssues([issue()], 'state', groupContext, {
+        showEmptyGroups: true,
+        ordering: 'manual',
+      }),
+      stateById,
+    );
+    expect(rows.map((row) => row.kind)).toEqual(['header', 'issue', 'header']);
+  });
+
+  it('regroups by assignee', () => {
+    const rows = buildRows(
+      groupIssues(
+        [issue({ id: 'a', assigneeId: 'user_2' }), issue({ id: 'b', identifier: 'ENG-9' })],
+        'assignee',
+        groupContext,
+        { showEmptyGroups: false, ordering: 'manual' },
+      ),
+      stateById,
+    );
+    expect(rows.flatMap((row) => (row.kind === 'header' ? [row.group.title] : []))).toEqual([
+      'Aditi Rao',
+      'No assignee',
+    ]);
+  });
+});
