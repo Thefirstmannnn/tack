@@ -15,7 +15,7 @@
     "@tack/db": "workspace:*",
     "@tack/services": "workspace:*",
     "@tack/shared": "workspace:*",
-    "drizzle-orm": "0.45.2",
+    "drizzle-orm": "0.45.4",
     "ioredis": "^6.0.0",
     "zod": "4.4.3"
   },
